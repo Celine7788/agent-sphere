@@ -394,8 +394,9 @@ export function CopilotView({ config, user }: CopilotViewProps) {
       if (selectedSessionId === null) {
         return;
       }
-      // 乐观登记已应答，避免随后 refreshLatest 用服务端旧 PENDING 回退
-      timeline.markClarificationAnswered(runId);
+      // 乐观登记已应答，避免随后 refreshLatest 用服务端旧 PENDING 回退。
+      // 必须带 clarificationId：同 run 续跑复用 runId，只按 runId 会误伤后续澄清。
+      timeline.markClarificationAnswered(runId, clarificationId);
       void api
         .clarify(selectedSessionId, runId, response, clarificationId)
         .catch((err) => setError((err as ApiError).message));

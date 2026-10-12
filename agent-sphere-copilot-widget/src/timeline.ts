@@ -10,13 +10,24 @@ export interface TimelineCursors {
 export const EMPTY_CURSORS: TimelineCursors = { oldestSeq: null, newestSeq: null };
 
 /**
+ * 澄清乐观态的本地保护键。必须包含 clarificationId：后端 resumeFromClarification 在 run
+ * 处于 AWAITING_USER 时会复用同一个 runId 续跑，一次会话里 agent 可能被追问多轮，
+ * 各轮 clarificationId 不同却共用 runId。只用 runId 会让「第二轮澄清」被误判成已应答，
+ * 待选项和输入框不渲染（刷新后 Ref 重建才恢复）。缺 id 时返回 null → 放弃保护、采信服务端。
+ */
+export function clarificationKey(runId: unknown, clarificationId: unknown): string | null {
+  if (runId == null || clarificationId == null || clarificationId === '') return null;
+  return `${runId}:${clarificationId}`;
+}
+
+/**
  * 按 seq 合并 timeline 页（后到行覆盖同 seq 旧行），并剔除被权威行替换掉的占位 subagent 行
  * （seq<0 实时占位；权威子 Agent 行到达后，同 refSubAgentRunId 的占位行移除）。返回按 seq 升序。
  */
 export function mergeTimeline(
   prev: TimelineRow[],
   rows: TimelineRow[],
-  answeredRunIds?: Set<string>,
+  answeredKeys?: Set<string>,
 ): TimelineRow[] {
   if (rows.length === 0) {
     return prev;
@@ -45,15 +56,17 @@ export function mergeTimeline(
       }
     }
     let incoming = r;
-    // 已本地应答的澄清：服务端旧 PENDING 不得回退乐观态
+    // 已本地应答的澄清：服务端旧 PENDING 不得回退乐观态。按 clarificationId 匹配，
+    // 缺 id 时不拦截（见 clarificationKey 注释）。
     if (
-      answeredRunIds &&
+      answeredKeys &&
       r.kind === 'clarification' &&
-      r.state === 'PENDING' &&
-      r.runId != null &&
-      answeredRunIds.has(String(r.runId))
+      r.state === 'PENDING'
     ) {
-      incoming = { ...r, state: 'ANSWERED' };
+      const key = clarificationKey(r.runId, r.content?.clarificationId);
+      if (key && answeredKeys.has(key)) {
+        incoming = { ...r, state: 'ANSWERED' };
+      }
     }
     map.set(incoming.seq, incoming);
   }

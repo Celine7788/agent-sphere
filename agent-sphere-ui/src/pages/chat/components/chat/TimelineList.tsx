@@ -518,20 +518,18 @@ function ClarificationCard({
       return [];
     }
   })();
+  // clarificationId 只存在于 content 里（后端 AgentTimelineServiceImpl 组装 content 时写入）。
+  // 顶层 row 上没有这个字段 —— 两个回调都必须用同一个来源，否则本地保护键与 API 调用
+  // 用的 id 可能不一致，导致乐观态防回退失效。
+  const clarificationId = content.clarificationId;
   const respond = (value: string) => {
     const v = String(value ?? '').trim();
     if (!v) return;
-    onRespondClarify?.(
-      { runId: row.runId, clarificationId: content.clarificationId },
-      v,
-    );
+    onRespondClarify?.({ runId: row.runId, clarificationId }, v);
     setText('');
   };
   const cancel = () =>
-    onCancelClarification?.({
-      runId: row.runId,
-      clarificationId: content.clarificationId,
-    });
+    onCancelClarification?.({ runId: row.runId, clarificationId });
   return (
     <div>
       <Typography.Text strong>

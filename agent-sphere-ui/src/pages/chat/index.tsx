@@ -30,6 +30,17 @@ import { useStyles } from './style';
 
 const SESSION_PAGE_SIZE = 10;
 
+/**
+ * 澄清乐观态的本地保护键。必须包含 clarificationId：同一次 run 续跑时后端复用 runId，
+ * 而每轮追问的 clarificationId 不同。只用 runId 会让「第二轮澄清」被误判成已应答。
+ * clarificationId 缺失时返回 null —— 调用方据此【放弃保护】、采信服务端状态，
+ * 因为错误拦截的代价（永久显示错误状态直到刷新）远大于放过一次竞态回退。
+ */
+function clarificationKey(runId: unknown, clarificationId: unknown): string | null {
+  if (runId == null || clarificationId == null || clarificationId === '') return null;
+  return `${runId}:${clarificationId}`;
+}
+
 /** 兼容后端 `YYYY-MM-DD HH:mm:ss[.ffffff]`（非 ISO）与 ISO 格式 → timestamp；失败返回 0。 */
 function toTs(v: any): number {
   if (typeof v === 'number') return v;
@@ -90,7 +101,11 @@ export default function Chat() {
   const currentRunIdRef = useRef<number | null>(null);
   const stopFallbackRef = useRef<number | null>(null);
   const pendingMsgConsumedRef = useRef(false);
-  // 已本地应答的澄清（按 runId）：防止随后 refreshLatest 用服务端旧 PENDING 覆盖乐观态
+  // 已本地应答的澄清：防止随后 refreshLatest 用服务端旧 PENDING 覆盖乐观态。
+  // 键必须是 runId + clarificationId，不能只用 runId —— 后端 resumeFromClarification
+  // 在 run 处于 AWAITING_USER 时会【复用同一个 runId】续跑，一次会话里 agent 可能被
+  // 追问多轮，各轮 clarificationId 不同却共用 runId。按 runId 加键会把后续澄清全部
+  // 误判为「已答过」并改写成 ANSWERED，待选项和输入框不渲染（刷新后 Ref 重建才恢复）。
   const answeredClarificationsRef = useRef<Set<string>>(new Set());
 
   const loadSessions = useCallback(async (offset: number) => {
@@ -177,6 +192,9 @@ export default function Chat() {
   }, []);
 
   // 按 runId（可选 clarificationId）就地更新 timeline 澄清行状态
+  // 把某次澄清的状态变更应用到匹配行。
+  // 匹配粒度：clarificationId 存在时【必须】命中同一轮；缺失时只允许命中 run 内
+  // 仍处于 PENDING 的行 —— 否则同 run 续跑产生的后续澄清会被连带改写。
   const applyClarificationState = (
     rows: any[],
     d: any,
@@ -186,11 +204,12 @@ export default function Chat() {
     rows.map((r) => {
       if (r.kind !== 'clarification') return r;
       if (Number(r.runId) !== Number(d?.runId)) return r;
-      if (
-        d?.clarificationId != null &&
-        r.content?.clarificationId != null &&
-        String(r.content.clarificationId) !== String(d.clarificationId)
-      ) {
+      const wantId = d?.clarificationId;
+      const haveId = r.content?.clarificationId;
+      if (wantId != null && haveId != null) {
+        if (String(haveId) !== String(wantId)) return r;
+      } else if (r.state !== 'PENDING') {
+        // 无 id 可比时只改待答复的行，绝不覆盖已终结的行
         return r;
       }
       return {
@@ -231,13 +250,13 @@ export default function Chat() {
             }
           }
           const incoming = { ...(m.get(r.seq) || {}), ...r };
-          // 已本地应答的澄清不被服务端旧 PENDING 回退
-          if (
-            incoming.kind === 'clarification' &&
-            incoming.state === 'PENDING' &&
-            answeredClarificationsRef.current.has(String(incoming.runId))
-          ) {
-            incoming.state = 'ANSWERED';
+          // 已本地应答的澄清不被服务端旧 PENDING 回退。按 clarificationId 匹配，
+          // 缺 id 时不拦截（见 clarificationKey 注释）。
+          if (incoming.kind === 'clarification' && incoming.state === 'PENDING') {
+            const key = clarificationKey(incoming.runId, incoming.content?.clarificationId);
+            if (key && answeredClarificationsRef.current.has(key)) {
+              incoming.state = 'ANSWERED';
+            }
           }
           m.set(r.seq, incoming);
         }
@@ -286,23 +305,38 @@ export default function Chat() {
   };
 
   const refreshLatest = async (sid: number) => {
-    try {
-      // 空游标（新会话首条消息）→ 直接拉尾页；否则按 afterSeq 增量补行
-      const page = await agentApi.sessions.getTimeline(
-        sid,
-        newestSeqRef.current != null
-          ? { afterSeq: newestSeqRef.current, limit: 10 }
-          : { limit: 10 },
-      );
-      const rows = Array.isArray(page?.rows) ? page.rows : [];
-      if (rows.length) {
-        mergeTimeline(rows);
-        bumpCursors(rows);
+    // afterSeq 分页在后端是 `LIMIT size+1`（AgentTimelineServiceImpl#list）。若两次刷新
+    // 之间新增超过 limit 行，单次只会补到第 limit 行，剩余行被 hasMore 标记但没有任何
+    // 「继续向后拉」的路径（loadOlderTimeline 走 beforeSeq，方向相反）→ 中间行永久缺失
+    // 到下次刷新。这里循环续拉，直到取空或不再 hasMore；轮次上限防异常情况下死循环。
+    const LIMIT = 10;
+    const MAX_ROUNDS = 20;
+    let round = 0;
+    let more = false;
+    do {
+      try {
+        // 空游标（新会话首条消息）→ 直接拉尾页；否则按 afterSeq 增量补行
+        const page = await agentApi.sessions.getTimeline(
+          sid,
+          newestSeqRef.current != null
+            ? { afterSeq: newestSeqRef.current, limit: LIMIT }
+            : { limit: LIMIT },
+        );
+        const rows = Array.isArray(page?.rows) ? page.rows : [];
+        const before = newestSeqRef.current;
+        if (rows.length) {
+          mergeTimeline(rows);
+          bumpCursors(rows);
+        }
+        more = !!page?.hasMore;
+        if (more) setTimelineHasMore(true);
+        // 游标未前进（空页，或后端返回的 seq 不大于当前游标）→ 无更多可取，直接终止，
+        // 否则同一页会被反复拉取直到 MAX_ROUNDS。
+        if (!rows.length || newestSeqRef.current === before) break;
+      } catch {
+        break;
       }
-      if (page?.hasMore) setTimelineHasMore(true);
-    } catch {
-      // ignore
-    }
+    } while (more && ++round < MAX_ROUNDS);
   };
 
   // 工具事件后的整页覆盖刷新：按 seq 覆盖同 seq 行，补齐迟到落库的 content（如截图 images）。
@@ -338,9 +372,11 @@ export default function Chat() {
 
   const handleTimelineClarify = async (row: any, response: string) => {
     if (!currentSession?.id || !row?.runId) return;
-    // 先记为已应答，防止随后的 refreshLatest 用服务端旧 PENDING 覆盖乐观态
-    answeredClarificationsRef.current.add(String(row.runId));
-    // 乐观回显：立即将澄清行置为已应答并显示用户提交内容（以 runId 为主匹配键）
+    const key = clarificationKey(row.runId, row.clarificationId);
+    // 先记为已应答，防止随后的 refreshLatest 用服务端旧 PENDING 覆盖乐观态。
+    // id 缺失时不记录：无法定位到具体是哪一轮澄清，记 runId 会误伤同 run 的后续澄清。
+    if (key) answeredClarificationsRef.current.add(key);
+    // 乐观回显：立即将澄清行置为已应答并显示用户提交内容
     setTimeline((prev) =>
       applyClarificationState(
         prev,
@@ -358,7 +394,7 @@ export default function Chat() {
       );
     } catch (e: any) {
       // 提交失败（重复提交/澄清已失效）：撤销本地应答并拉取权威状态，避免卡死
-      answeredClarificationsRef.current.delete(String(row.runId));
+      if (key) answeredClarificationsRef.current.delete(key);
       message.error(e?.message || '澄清提交失败，请重试');
       void refreshLatest(currentSession.id);
     }
@@ -918,14 +954,14 @@ export default function Chat() {
             if (evtType.startsWith('clarification_')) {
               if (evtType === 'clarification_responded') {
                 // 记为已应答：防止随后 refreshLatest 用服务端旧 PENDING 覆盖乐观态
-                answeredClarificationsRef.current.add(String(d?.runId));
+                const key = clarificationKey(d?.runId, d?.clarificationId);
+                if (key) answeredClarificationsRef.current.add(key);
                 setTimeline((prev) =>
                   applyClarificationState(prev, d, 'ANSWERED', d?.response),
                 );
-              } else if (
-                evtType === 'clarification_dismissed' ||
-                evtType === 'clarification_expired'
-              ) {
+              } else if (evtType === 'clarification_dismissed') {
+                // 后端 ClarificationStatus 只有 PENDING/RESPONDED/DISMISSED，
+                // 不存在 clarification_expired —— 该分支此前永远不会命中。
                 setTimeline((prev) =>
                   applyClarificationState(prev, d, 'CANCELLED'),
                 );

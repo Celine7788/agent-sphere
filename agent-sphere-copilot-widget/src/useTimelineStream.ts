@@ -8,6 +8,7 @@ import {
   fetchOlderTimeline,
   fetchTailTimeline,
   mergeTimeline,
+  clarificationKey,
   updateCursors,
   type TimelineCursors,
 } from './timeline';
@@ -93,7 +94,7 @@ interface TimelineStream {
   /** 建立会话 SSE 连接（会话切换时调用）；需传 apiBase 以构造正确的流地址（同源相对或跨域绝对）。 */
   connect: (sessionId: number, token: string, apiBase: string) => void;
   /** 乐观提交澄清后登记已应答（防 refreshLatest 回退乐观态）。 */
-  markClarificationAnswered: (runId: number) => void;
+  markClarificationAnswered: (runId: number, clarificationId?: string | null) => void;
 }
 
 /** 子 Agent LIVE 占位行 seq：负且按 subAgentRunId 唯一（避免同 seq 冲突）。 */
@@ -113,7 +114,7 @@ export function useTimelineStream(api: ApiClient): TimelineStream {
   const sessionIdRef = useRef<number | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   /** 已本地应答的澄清 runId：防止 refreshLatest 用服务端旧 PENDING 回退乐观态。 */
-  const answeredRunIdsRef = useRef<Set<string>>(new Set());
+  const answeredClarificationKeysRef = useRef<Set<string>>(new Set());
   const reconnectAttemptRef = useRef(0);
   const reconnectTimerRef = useRef<number | null>(null);
 
@@ -212,7 +213,7 @@ export function useTimelineStream(api: ApiClient): TimelineStream {
           cursorsRef.current,
           8,
         );
-        setRows((prev) => mergeTimeline(prev, older, answeredRunIdsRef.current));
+        setRows((prev) => mergeTimeline(prev, older, answeredClarificationKeysRef.current));
         setHasMore(m);
       } catch {
         // 翻页失败保持现状
@@ -231,7 +232,7 @@ export function useTimelineStream(api: ApiClient): TimelineStream {
           cursorsRef.current,
           10,
         );
-        setRows((prev) => mergeTimeline(prev, fresh, answeredRunIdsRef.current));
+        setRows((prev) => mergeTimeline(prev, fresh, answeredClarificationKeysRef.current));
         reconcilePendingUserRows(fresh);
       } catch {
         // 补拉失败忽略（SSE 打字机仍会就地更新）
@@ -245,7 +246,7 @@ export function useTimelineStream(api: ApiClient): TimelineStream {
       try {
         const { rows: fresh } = await fetchTailTimeline(getPage(sessionId), 30);
         if (fresh.length) {
-          setRows((prev) => mergeTimeline(prev, fresh, answeredRunIdsRef.current));
+          setRows((prev) => mergeTimeline(prev, fresh, answeredClarificationKeysRef.current));
           // 更新游标：尾窗视作权威最新，推动 afterSeq
           updateCursors(cursorsRef.current, {
             rows: fresh,
@@ -475,27 +476,32 @@ export function useTimelineStream(api: ApiClient): TimelineStream {
       // 澄清：本地就地更新 + 记录已应答（防 refreshLatest 回退）
       if (String(evtType).startsWith('clarification_')) {
         if (evtType === 'clarification_responded') {
-          if (d?.runId != null) answeredRunIdsRef.current.add(String(d.runId));
+          const respondedKey = clarificationKey(d?.runId, d?.clarificationId);
+          if (respondedKey) answeredClarificationKeysRef.current.add(respondedKey);
           setRows((prev) =>
-            prev.map((r) =>
-              r.kind === 'clarification' &&
-              Number(r.runId) === Number(d?.runId) &&
-              r.state === 'PENDING'
-                ? {
-                    ...r,
-                    state: 'ANSWERED',
-                    content: {
-                      ...r.content,
-                      response: d?.response ?? r.content.response,
-                    },
-                  }
-                : r,
-            ),
+            prev.map((r) => {
+              if (r.kind !== 'clarification') return r;
+              if (Number(r.runId) !== Number(d?.runId)) return r;
+              // 有 id 必须命中同一轮；无 id 时只改仍 PENDING 的行，避免连带改写
+              // 同 run 续跑产生的后续澄清。
+              const wantId = d?.clarificationId;
+              const haveId = r.content?.clarificationId;
+              if (wantId != null && haveId != null) {
+                if (String(haveId) !== String(wantId)) return r;
+              } else if (r.state !== 'PENDING') {
+                return r;
+              }
+              return {
+                ...r,
+                state: 'ANSWERED',
+                content: {
+                  ...r.content,
+                  response: d?.response ?? r.content.response,
+                },
+              };
+            }),
           );
-        } else if (
-          evtType === 'clarification_dismissed' ||
-          evtType === 'clarification_expired'
-        ) {
+        } else if (evtType === 'clarification_dismissed') {
           setRows((prev) =>
             prev.map((r) =>
               r.kind === 'clarification' &&
@@ -584,7 +590,7 @@ export function useTimelineStream(api: ApiClient): TimelineStream {
       sessionIdRef.current = sessionId;
       cursorsRef.current = { oldestSeq: null, newestSeq: null };
       pendingSeqRef.current = 0;
-      answeredRunIdsRef.current.clear();
+      answeredClarificationKeysRef.current.clear();
       setRows([]);
       setSubAgentLiveMap({});
       setPendingUserRows([]);
@@ -598,9 +604,11 @@ export function useTimelineStream(api: ApiClient): TimelineStream {
     [clearReconnectTimer, loadInitial, openStream],
   );
 
-  /** 乐观提交澄清后立即登记已应答，防止 refreshLatest 用旧 PENDING 回退。 */
-  const markClarificationAnswered = useCallback((runId: number) => {
-    answeredRunIdsRef.current.add(String(runId));
+  /** 乐观提交澄清后立即登记已应答，防止 refreshLatest 用旧 PENDING 回退。
+   *  键必须是 runId+clarificationId：同 run 续跑会复用 runId，只按 runId 会误伤后续澄清。 */
+  const markClarificationAnswered = useCallback((runId: number, clarificationId?: string | null) => {
+    const key = clarificationKey(runId, clarificationId);
+    if (key) answeredClarificationKeysRef.current.add(key);
   }, []);
 
   // 卸载时断开连接并清理重连定时器
