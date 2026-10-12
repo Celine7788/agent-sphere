@@ -71,7 +71,7 @@ describe('mergeTimeline 澄清乐观态保护', () => {
     const answered = new Set([clarificationKey(42, 'c1') as string]);
     const merged = mergeTimeline(
       [],
-      [{ seq: 12, runId: 42, kind: 'assistant', state: 'RUNNING' }],
+      [{ seq: 12, runId: 42, kind: 'assistant', state: 'RUNNING', content: { text: 'x' } }],
       answered,
     );
     expect(merged[0].state).toBe('RUNNING');
