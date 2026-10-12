@@ -2,6 +2,8 @@
  * TabManager — per-run tab state, frames, content-script injection and the
  * "AgentSphere" tab group that aggregates every tab the plugin operates on.
  */
+import { loadSessionState, saveSessionState, clearSessionState } from './session-state.js';
+
 const CONTENT_FILES = ['content-locator.js', 'content.js'];
 
 // content script sendMessage 可能在 tab 导航/重建时永不回包 → 加超时，避免命令悬挂。
@@ -28,6 +30,7 @@ export class TabManager {
     chrome.tabs.onCreated.addListener((tab) => {
       if (tab.openerTabId === this.controlledTabId) {
         this.controlledTabId = tab.id;
+        saveSessionState({ controlledTabId: tab.id });
         this.injectContentScript(tab.id);
         this.groupTab(tab.id);
         this.tabFollowPending = {
@@ -53,20 +56,88 @@ export class TabManager {
       this.injectedTabs.delete(tabId);
       if (tabId === this.controlledTabId) {
         this.controlledTabId = null;
+        clearSessionState('controlledTabId');
       }
     });
 
     chrome.tabGroups.onRemoved.addListener((groupId) => {
-      if (groupId === this.pluginGroupId) this.pluginGroupId = null;
+      if (groupId === this.pluginGroupId) {
+        this.pluginGroupId = null;
+        clearSessionState('pluginGroupId');
+      }
     });
   }
 
   setControlled(tabId) {
     this.controlledTabId = tabId;
+    saveSessionState({ controlledTabId: tabId });
   }
 
   getControlled() {
     return this.controlledTabId;
+  }
+
+  /**
+   * Normalise a URL for equality comparison when reusing tabs.
+   * The old check was a raw `tab.url === params.url` string compare, which missed
+   * every tab differing only by hash / protocol / www / trailing slash.
+   */
+  normalizeUrl(u) {
+    try {
+      const url = new URL(u);
+      url.hash = '';
+      url.protocol = 'https:';
+      url.hostname = url.hostname.replace(/^www\./, '');
+      if (url.pathname.length > 1) url.pathname = url.pathname.replace(/\/+$/, '');
+      return url.toString().toLowerCase();
+    } catch (e) {
+      return String(u || '').toLowerCase();
+    }
+  }
+
+  /**
+   * Find an already-open tab showing `url`, preferring the controlled tab, then any
+   * tab inside the AgentSphere group, then anything else. Never returns non-http(s)
+   * tabs (chrome://, the Web Store, PDF viewer) — those can't be operated on.
+   */
+  async findReusableTab(url) {
+    const want = this.normalizeUrl(url);
+    if (!want) return null;
+    const st = await loadSessionState();
+    const controlled = st.controlledTabId ?? this.controlledTabId;
+    const gid = this.pluginGroupId;
+    const tabs = await chrome.tabs.query({}).catch(() => []);
+    const usable = tabs.filter((t) => t.id != null && /^https?:/.test(t.url || t.pendingUrl || ''));
+    const ranked = [
+      ...usable.filter((t) => t.id === controlled),
+      ...usable.filter((t) => gid != null && t.groupId === gid),
+      ...usable,
+    ];
+    for (const t of ranked) {
+      if (this.normalizeUrl(t.url || t.pendingUrl) === want) return t;
+    }
+    return null;
+  }
+
+  /**
+   * Re-aggregate the plugin's tabs after a service-worker restart, which wipes
+   * pluginGroupId. Without this, every plugin tab left open by a previous worker
+   * would fall outside the group the user sees.
+   */
+  async regroupControlledTabs() {
+    const st = await loadSessionState();
+    this.pluginGroupId = st.pluginGroupId ?? null;
+    const tid = st.controlledTabId ?? this.controlledTabId;
+    if (tid == null) return;
+    const tab = await chrome.tabs.get(tid).catch(() => null);
+    if (!tab) return;
+    await this.groupTab(tab.id);
+    const all = await chrome.tabs.query({}).catch(() => []);
+    for (const t of all) {
+      if (t.id === tid) continue;
+      if (t.openerTabId === tid) await this.groupTab(t.id);
+      else if (t.groupId != null && t.groupId === this.pluginGroupId) await this.groupTab(t.id);
+    }
   }
 
   async injectContentScript(tabId) {
@@ -107,20 +178,21 @@ export class TabManager {
 
   // Send a message to a tab's content script, re-injecting when the receiver is missing.
   // frameId 语义：undefined/null=全部框架广播；0=定向顶层 document；>0=定向子框架。
-  async askContent(tabId, msg, maxRetries = 3, frameId = 0) {
+  async askContent(tabId, msg, maxRetries = 3, frameId = 0, timeoutMs = 15000) {
     const sendOpts =
       frameId === undefined || frameId === null ? undefined : { frameId };
     for (let i = 0; i < maxRetries; i++) {
       try {
         return await withTimeout(
           chrome.tabs.sendMessage(tabId, msg, sendOpts),
-          15000,
+          timeoutMs,
           new Error('Content script sendMessage timed out'),
         );
       } catch (e) {
         if ((String(e.message).includes('Receiving end does not exist')
             || String(e.message).includes('timed out'))
-          && i < maxRetries - 1) {
+          && i < maxRetries - 1
+          && timeoutMs > 1000) {
           this.injectedTabs.delete(tabId);
           const injected = await this.injectContentScript(tabId);
           if (!injected) break;
@@ -134,21 +206,42 @@ export class TabManager {
   }
 
   // Aggregate the tab into the single "AgentSphere" group (creates it once).
+  // The group id is persisted because the service worker restarts and loses it —
+  // without that, every restart created a NEW group and the tabs visibly split.
   async groupTab(tabId) {
     try {
-      if (this.pluginGroupId != null) {
-        await chrome.tabs.group({ tabIds: [tabId], groupId: this.pluginGroupId });
-      } else {
-        const groupId = await chrome.tabs.group({ tabIds: [tabId] });
-        this.pluginGroupId = groupId;
-        try {
-          await chrome.tabGroups.update(groupId, { title: 'AgentSphere', color: 'cyan' });
-        } catch (e) {
-          /* group styling failure is non-fatal */
+      if (this.pluginGroupId == null) {
+        const st = await loadSessionState();
+        this.pluginGroupId = st.pluginGroupId ?? null;
+      }
+      let gid = this.pluginGroupId;
+      if (gid != null) {
+        // A remembered group id can be stale (user ungrouped/closed it) — verify.
+        const g = await chrome.tabGroups.get(gid).catch(() => null);
+        if (!g) {
+          gid = null;
+          this.pluginGroupId = null;
+          await clearSessionState('pluginGroupId');
         }
       }
+      if (gid != null) {
+        await chrome.tabs.group({ tabIds: [tabId], groupId: gid });
+        return true;
+      }
+      const newId = await chrome.tabs.group({ tabIds: [tabId] });
+      this.pluginGroupId = newId;
+      await saveSessionState({ pluginGroupId: newId });
+      try {
+        await chrome.tabGroups.update(newId, { title: 'AgentSphere', color: 'cyan' });
+      } catch (e) {
+        /* group styling failure is non-fatal */
+      }
+      return true;
     } catch (e) {
-      // Tabs that cannot be grouped (chrome://, extension pages) are silently skipped.
+      // Tabs that cannot be grouped (chrome://, extension pages) land here — as can a
+      // genuine failure. Callers may report; swallowing silently hides both.
+      console.warn('[AgentSphere] groupTab failed for tab', tabId, e?.message);
+      return false;
     }
   }
 

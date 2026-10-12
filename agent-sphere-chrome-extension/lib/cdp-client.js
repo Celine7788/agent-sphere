@@ -9,7 +9,14 @@
  *  - all operations are serialized through a promise queue so attach/evaluate/
  *    detach never interleave across call sites.
  *  - `evaluate` retries exactly once on detach races (never on page exceptions).
+ *  - every queued operation carries its own deadline so a hung page command can
+ *    never poison the queue for every later operation.
  */
+
+// 默认操作 deadline：输入类（dispatchMouseEvent/insertText/dispatchKeyEvent）本就毫秒级，
+// 15s 是极宽松的兜底。executeJS 走 evaluate() 时单独传更大的值。
+const CDP_OP_TIMEOUT_MS = 15000;
+
 export class CdpClient {
   constructor() {
     this.sessions = new Map();
@@ -83,8 +90,26 @@ export class CdpClient {
     });
   }
 
-  _serialized(fn) {
-    const p = this._queue.then(fn, fn);
+  _serialized(fn, timeoutMs = CDP_OP_TIMEOUT_MS) {
+    // 防队列中毒：若 fn 永不 settle（页面里跑了 while(true) 或长挂起的 fetch），
+    // this._queue 会永久 pending，之后所有 CDP 操作（click/insertText/hitTest/截图）
+    // 全部排队不执行，直到 service worker 重启。这里给每次操作加独立 deadline，
+    // 让队列始终能继续流动。
+    // 注意：超时并不能取消页面里已在跑的 CDP 命令（CDP 无取消语义），
+    // 但足以保证后续命令不被这一次挂起堵死。
+    const guarded = () => {
+      let timer;
+      return Promise.race([
+        Promise.resolve().then(fn),
+        new Promise((_, reject) => {
+          timer = setTimeout(
+            () => reject(new Error('CDP operation timed out after ' + timeoutMs + 'ms')),
+            timeoutMs,
+          );
+        }),
+      ]).finally(() => clearTimeout(timer)); // 两条路径都要清理，否则定时器会堆积
+    };
+    const p = this._queue.then(guarded, guarded);
     this._queue = p.catch(() => {});
     return p;
   }
@@ -124,7 +149,9 @@ export class CdpClient {
     return { success: true, data: value, _resultType: typeof value, method: 'debugger' };
   }
 
-  async evaluate(tabId, expression) {
+  /** executeJS 的 CDP 层入口（唯一调用方是 background 的 executeJsOnTab）。
+   *  timeoutMs 由调用方给出，必须小于后端 executeJS 超时，扩展才能先返回干净的 TIMEOUT。 */
+  async evaluate(tabId, expression, timeoutMs = CDP_OP_TIMEOUT_MS) {
     return this._serialized(async () => {
       try {
         // 包一层：无返回值时一并捕获 document.title（副作用验证技巧），
@@ -144,7 +171,7 @@ export class CdpClient {
         // "Another debugger is already attached" (DevTools open on the tab): not recoverable here.
         throw e;
       }
-    });
+    }, timeoutMs);
   }
 
   // 解开 evaluate 的 void-title 包装：未返回值 → __NO_RETURN__ + _documentTitle；正常值原样透传。
@@ -166,6 +193,46 @@ export class CdpClient {
       return this._toResult({ ...raw, value: v.__asV });
     }
     return this._toResult(raw);
+  }
+
+  /** 命中校验：报告该 CSS 坐标处实际命中的元素描述（<tag#id.class>）。
+   *  在主视口坐标空间工作，因此跨源 OOPIF 也能覆盖 —— content 侧的
+   *  elementFromPoint 只知道自己 iframe 的坐标空间，跨源时够不着。
+   *  对应 Codex 的 DOM.getNodeForLocation + DOM.describeNode 命中比对。
+   *  只读探测，探测失败一律返回 hit:false，绝不阻断调用方的降级流程。 */
+  async hitTest(tabId, x, y) {
+    try {
+      await this.attach(tabId);
+      const loc = await this.sendCommand(tabId, 'DOM.getNodeForLocation', {
+        x: Math.round(x), y: Math.round(y), includeUserAgentShadowDOM: true,
+      });
+      if (!loc || !loc.backendNodeId) return { hit: false, desc: '', backendNodeId: null };
+      let tag = '';
+      let id = '';
+      let cls = '';
+      try {
+        const described = await this.sendCommand(tabId, 'DOM.describeNode', { backendNodeId: loc.backendNodeId });
+        const node = described && described.node;
+        if (node) {
+          tag = String(node.localName || node.nodeName || '').toLowerCase();
+          const attrs = Array.isArray(node.attributes) ? node.attributes : [];
+          for (let i = 0; i < attrs.length; i += 2) {
+            if (attrs[i] === 'id' && !id) id = attrs[i + 1] || '';
+            if (attrs[i] === 'class' && !cls) cls = attrs[i + 1] || '';
+          }
+        }
+      } catch (e) {
+        // describeNode 失败：仍然报告命中，只是描述不完整
+      }
+      const clsOut = cls.trim() ? '.' + cls.trim().split(/\s+/).slice(0, 3).join('.') : '';
+      return {
+        hit: true,
+        backendNodeId: loc.backendNodeId,
+        desc: `<${tag || 'unknown'}${id ? '#' + id : ''}${clsOut}>`,
+      };
+    } catch (e) {
+      return { hit: false, desc: '', backendNodeId: null };
+    }
   }
 
   /** 受信鼠标点击（CDP Input）：合成事件在严格 SPA 下常不触发

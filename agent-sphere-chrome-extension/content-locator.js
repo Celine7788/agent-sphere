@@ -8,6 +8,16 @@
 window.__asContent = window.__asContent || {};
 
 (function () {
+  // 幂等守卫：askContent 在 "Receiving end does not exist" 时会删掉注入缓存并重新注入
+  // （tab-manager.js），没有守卫时本文件的全部 AS.* 会被重复定义。
+  //
+  // 必须写在 IIFE 内部：本文件经 chrome.scripting.executeScript({files}) 以【经典脚本】
+  // 加载，而顶层 return 在经典脚本里是 SyntaxError —— 一旦放到 IIFE 外，整个文件不会执行，
+  // window.__asContent 不会被创建，content.js 里所有 AS.* 调用随之 TypeError。
+  // content.js 的同类守卫同样位于其 IIFE 内（见该文件头部）。
+  if (window.__asLocatorLoaded) return;
+  window.__asLocatorLoaded = true;
+
   const AS = window.__asContent;
 
   // Convert a glob pattern (`*`, `?`) into a case-insensitive RegExp.
@@ -489,6 +499,143 @@ window.__asContent = window.__asContent || {};
     } catch (e) { /* 忽略覆盖检查异常 */ }
     return true;
   };
+
+  /** 前置断言：把「能不能操作」拆成可回报的状态，供 locate 在滚动前后各校验一次。
+   *  对应 Codex 的 elementState visible/enabled —— 它在 scrollIntoView 前后跑两遍，
+   *  ours 只在结果里报一个 clickable 布尔值、不阻断，于是 disabled 按钮也会被点。
+   *  注意这里刻意不含 covered：isActionable 的「软提示」哲学保留不动，
+   *  遮挡交给 writeAction 的降级重试处理，而不是就地判死。 */
+  AS.assertActionable = function (el) {
+    if (!el || el.nodeType !== 1) return { ok: false, state: 'connected' };
+    if (!el.isConnected) return { ok: false, state: 'connected' };
+    if (el.disabled || el.getAttribute('aria-disabled') === 'true') return { ok: false, state: 'enabled' };
+    if (!asIsVisible(el)) return { ok: false, state: 'visible' };
+    try {
+      if (ownerWin(el).getComputedStyle(el).pointerEvents === 'none') return { ok: false, state: 'visible' };
+    } catch (e) { /* 样式读取异常不阻断 */ }
+    return { ok: true, state: null };
+  };
+
+  /** 等元素几何收敛：连续 stableFrames 帧 rect 完全相同才算稳定。
+   *  替代原先 `setTimeout(60)` 的盲等 —— 那个常数假设滚动动画已经结束，在懒加载
+   *  撑开布局 / 虚拟列表重排 / SPA 展开时必然取到中间态坐标。
+   *  参数照抄 Codex waitForStableBoundingRect：连续 2 次相同即收敛，最多 10 帧。
+   *  setTimeout(50) 兜底，防止后台标签页 rAF 被节流后死等。 */
+  AS.waitStableRect = function (el, opts) {
+    const stableFrames = (opts && opts.stableFrames) || 2;
+    const maxFrames = (opts && opts.maxFrames) || 10;
+    const win = el && el.ownerDocument && el.ownerDocument.defaultView;
+    if (!win || typeof win.requestAnimationFrame !== 'function') return Promise.resolve(null);
+    const waitFrame = () => new Promise((resolve) => {
+      let done = false;
+      const timer = win.setTimeout(() => { if (!done) { done = true; resolve(); } }, 50);
+      win.requestAnimationFrame(() => {
+        if (done) return;
+        done = true;
+        win.clearTimeout(timer);
+        resolve();
+      });
+    });
+    const sameRect = (a, b) => a.left === b.left && a.top === b.top
+      && a.width === b.width && a.height === b.height;
+    return (async () => {
+      let prev;
+      try { prev = el.getBoundingClientRect(); } catch (e) { return null; }
+      let stable = 0;
+      for (let i = 0; i < maxFrames; i++) {
+        await waitFrame();
+        let cur;
+        try { cur = el.getBoundingClientRect(); } catch (e) { return null; }
+        if (sameRect(prev, cur)) {
+          if (++stable >= stableFrames) return cur;
+        } else {
+          stable = 0;
+          prev = cur;
+        }
+      }
+      return null; // 未收敛 → 调用方按不可点处理，绝不盲点
+    })();
+  };
+
+  /** label 跟随重定向：把 <label> 解析到它关联的真实控件。
+   *  对应 Codex retarget(el,"follow-label") —— 它在 fill/selectText/selectOptions 等
+   *  每个操作的第一步都做这件事。登录页/搜索页大量控件是 label 包 input 的结构，
+   *  LLM 给的 ref 常常落在 label 上。 */
+  AS.retargetByLabel = function (el) {
+    if (!el || el.nodeType !== 1 || el.tagName !== 'LABEL') return el;
+    const doc = el.ownerDocument;
+    let ctrl = null;
+    try { ctrl = el.control || null; } catch (e) { /* 旧浏览器无 control */ }
+    if (!ctrl && el.htmlFor) {
+      try { ctrl = doc.getElementById(el.htmlFor); } catch (e) { /* ignore */ }
+    }
+    if (!ctrl) {
+      const t = (el.textContent || '').trim();
+      if (t) {
+        const pool = doc.querySelectorAll('input,select,textarea,button,[contenteditable]');
+        for (const c of pool) {
+          let labels = null;
+          try { labels = c.labels; } catch (e) { /* ignore */ }
+          if (labels && Array.prototype.some.call(labels, (l) => (l.textContent || '').trim() === t)) {
+            ctrl = c;
+            break;
+          }
+        }
+      }
+    }
+    return ctrl && ctrl.nodeType === 1 ? ctrl : el;
+  };
+
+  /** 主视口坐标处的命中判定：确认点击点真的落在目标上，而不是被别的东西盖住。
+   *  elementFromPoint 用的是本 frame 视口坐标，而 mainFramePoint 给的是主视口坐标，
+   *  所以要减去 frame 偏移。跨源 iframe 取不到 → 返回 ok:true（不阻断），
+   *  由 background 侧的 CDP DOM.getNodeForLocation 兜底。
+   *  desc 形如 <tag#id.class>，与 Codex describeBackendNodeForHitTarget 同格式。 */
+  AS.hitDescriptorAt = function (el, mainX, mainY) {
+    try {
+      const doc = el.ownerDocument;
+      if (!doc) return { ok: true, desc: '' };
+      const off = frameOffsetOf(el);
+      const hit = doc.elementFromPoint(mainX - off.x, mainY - off.y);
+      if (!hit) return { ok: false, desc: '<none>' };
+      if (hit === el || el.contains(hit) || hit.contains(el)) return { ok: true, desc: '' };
+      return { ok: false, desc: describeLite(hit) };
+    } catch (e) {
+      return { ok: true, desc: '' }; // 跨源 / 文档正在导航 → 不阻断
+    }
+  };
+
+  /** 元素相对顶层视口的累计偏移（iframe 内沿 frameElement 链累加）。 */
+  function frameOffsetOf(el) {
+    let x = 0;
+    let y = 0;
+    let win = ownerWin(el);
+    let guard = 0;
+    while (win && win !== window.top && guard++ < 10) {
+      const fe = win.frameElement;
+      if (!fe) break;
+      let fr;
+      try { fr = fe.getBoundingClientRect(); } catch (e) { break; }
+      x += fr.left;
+      y += fr.top;
+      win = fe.ownerDocument && fe.ownerDocument.defaultView;
+    }
+    return { x, y };
+  }
+
+  /** 轻量元素描述 <tag#id.class>，用于失败诊断里指名拦截者。 */
+  function describeLite(node) {
+    if (!node || node.nodeType !== 1) return '<unknown>';
+    const tag = (node.tagName || 'unknown').toLowerCase();
+    let id = '';
+    let cls = '';
+    try {
+      id = node.id || '';
+      cls = (node.getAttribute('class') || '').trim();
+    } catch (e) { /* ignore */ }
+    const clsOut = cls ? '.' + cls.split(/\s+/).slice(0, 3).join('.') : '';
+    return `<${tag}${id ? '#' + id : ''}${clsOut}>`;
+  }
 
   /** 将元素中心换算到主 frame 视口坐标（CDP Input.dispatchMouseEvent 用）。
    *  iframe 内元素沿 window.frameElement 链累加偏移，得到顶层视口 CSS 像素。 */
