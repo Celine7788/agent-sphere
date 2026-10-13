@@ -15,7 +15,7 @@ spec:
     spec:
       containers:
       - name: frontend
-        image: crpi-beo82etap5e8va9b.cn-wulanchabu.personal.cr.aliyuncs.com/nullpointexception-i/agent-sphere-frontend:sha-c3e59df
+        image: crpi-beo82etap5e8va9b.cn-wulanchabu.personal.cr.aliyuncs.com/nullpointexception-i/agent-sphere-frontend:sha-246f828
         ports:
         - containerPort: 80
         resources:
