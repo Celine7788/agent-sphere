@@ -4,6 +4,7 @@ import com.buukle.agent.capability.builtin.spi.CapabilityBuiltinSpi;
 import com.buukle.agent.common.mcp.TaskMcpCredentialStore;
 import com.buukle.agent.capability.mcp.spi.CapabilityMcpSpi;
 import com.buukle.agent.instance.spi.ClarificationSpi;
+import com.buukle.agent.instance.spi.PendingWaitSpi;
 import com.buukle.agent.instance.spi.SessionTodoSpi;
 import com.buukle.agent.common.sub.agent.ToolRefs;
 import com.buukle.agent.runtime.kernel.contract.TurnToolCall;
@@ -47,6 +48,8 @@ class ToolExecutorSkillTest {
     @Mock
     ClarificationSpi clarificationSpi;
     @Mock
+    PendingWaitSpi pendingWaitSpi;
+    @Mock
     DelegateService delegateService;
     @Mock
     TaskMcpCredentialStore taskMcpCredentialStore;
@@ -56,7 +59,7 @@ class ToolExecutorSkillTest {
     @BeforeEach
     void setUp() {
         toolExecutor = new ToolExecutor(mcpSpis, builtinSpi, cliExecutorService, sessionTodoSpi,
-                eventPublisher, clarificationSpi, delegateService, taskMcpCredentialStore);
+                eventPublisher, clarificationSpi, pendingWaitSpi, delegateService, taskMcpCredentialStore);
     }
 
     private RuntimeTool delegateTool() {

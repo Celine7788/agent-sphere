@@ -25,6 +25,7 @@ public class RunConverter {
         vo.setAttachments(parseAttachments(run.getAttachments()));
         vo.setStatus(run.getStatus());
         vo.setLoopCapped(run.getLoopCapped());
+        vo.setLoopCount(run.getLoopCount());
         vo.setCreatedBy(run.getCreatedBy());
         vo.setCreatedAt(run.getCreatedAt() != null ? run.getCreatedAt().toString() : null);
         return vo;
@@ -54,6 +55,7 @@ public class RunConverter {
                 ? JsonUtils.toJson(vo.getAttachments()) : null);
         run.setStatus(vo.getStatus());
         run.setLoopCapped(vo.getLoopCapped());
+        run.setLoopCount(vo.getLoopCount());
         return run;
     }
 

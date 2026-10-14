@@ -128,6 +128,14 @@ buukle:
       execution-timeout: 60s                       # 工具执行超时 / Tool execution timeout
       cli-timeout: 30s                             # CLI 工具超时 / CLI tool timeout
 
+    # ============================================================
+    # wait 工具（挂起-恢复）/ Wait Tool (suspend-resume)
+    # ============================================================
+    wait:
+      # 唤醒补偿扫描 cron。主路径是每条等待记录一个内存定时器；
+      # 副本重启/发布会让定时器全丢，这一层按 wake_at 兜底（CAS 保证不重复恢复）。
+      wake-cron: "*/10 * * * * ?"                   # 唤醒补偿扫描 / Wait wake compensation sweep
+
       # ---- 网页读取工具 / Web Read Tool ----
       web-read:
         connect-timeout: 10s                       # 连接超时 / Connect timeout

@@ -22,6 +22,7 @@ import com.buukle.agent.runtime.kernel.config.FallbackRouteExecutor;
 import com.buukle.agent.runtime.kernel.config.LlmRequestConfigurer;
 import com.buukle.agent.runtime.kernel.config.RouteListBuilder;
 import com.buukle.agent.runtime.kernel.constants.ChatClarification;
+import com.buukle.agent.runtime.kernel.constants.WaitConstants;
 import com.buukle.agent.runtime.kernel.constants.RunnerConstants;
 import com.buukle.agent.runtime.kernel.constants.RuntimeEventTypeConstant;
 import com.buukle.agent.runtime.kernel.contract.TurnToolCall;
@@ -520,16 +521,25 @@ eventPublisher.publishEvent(new RuntimeEventVO(ToolCallStatus.FAILED,
                         .setPublishId(subRunPolicy.publishIdPrefix() + subRunToolId + "-" + UUID.randomUUID().toString().substring(0, 8))));
     }
 
-    /** 子 Agent 工具集 = 父 tools 全集，仅剔除 ask_clarification。 */
+    /** 子 Agent 工具集 = 父 tools 全集，剔除 ask_clarification 与 wait。 */
     private List<RuntimeTool> filterTools(List<RuntimeTool> sessionTools) {
         List<RuntimeTool> result = new ArrayList<>();
         if (sessionTools == null) {
             return result;
         }
         for (RuntimeTool tool : sessionTools) {
+            if (tool.getToolRef() == null) {
+                result.add(tool);
+                continue;
+            }
             // 嵌套 Sub run 禁止 ask_clarification：子 Agent 不得向用户提问
-            if (tool.getToolRef() != null
-                    && tool.getToolRef().equals(ToolRefs.builtin(ChatClarification.INTERNAL_NAME))) {
+            if (tool.getToolRef().equals(ToolRefs.builtin(ChatClarification.INTERNAL_NAME))) {
+                continue;
+            }
+            // 同样禁止 wait：挂起-恢复的 break 判定只存在于主 SessionRunner 循环，
+            // 子 Agent 路径没有那套检测。若放行，ToolExecutor 仍会建 pending 记录并返回
+            // {"status":"waiting"}，但没人去认领它 —— 变成一次静默的空等。
+            if (tool.getToolRef().equals(ToolRefs.builtin(WaitConstants.INTERNAL_NAME))) {
                 continue;
             }
             result.add(tool);

@@ -14,11 +14,9 @@ import com.buukle.agent.capability.builtin.tool.spi.util.ToolSchemaUtil;
 import com.buukle.agent.capability.skill.dtvo.vo.SkillVO;
 import com.buukle.agent.capability.skill.spi.CapabilitySkillSpi;
 import com.buukle.agent.instance.dtvo.vo.CapabilityVO;
-import com.buukle.agent.instance.dtvo.vo.SessionTodoVO;
 import com.buukle.agent.instance.dtvo.vo.SessionVO;
 import com.buukle.agent.instance.spi.InstanceCapabilitySpi;
 import com.buukle.agent.instance.spi.SessionSpi;
-import com.buukle.agent.instance.spi.SessionTodoSpi;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
@@ -43,17 +41,13 @@ public class CapabilityBuiltinToolSkillLibrary implements CapabilityBuiltinToolS
     static final int PREVIEW_LENGTH = 200;
     static final String MARKDOWN_FENCE = "```json";
 
-    /** 播种待办时把 H2 步骤录入 session 待办（见 seedTodosFromSkill）。 */
-    static final String TODO_STATUS_PENDING = "pending";
-    static final String TODO_PRIORITY_MEDIUM = "medium";
-    /** {agent_session_todo.content} 是 VARCHAR(500)。 */
-    static final int TODO_CONTENT_MAX = 500;
-    /** 视为「步骤」的 H2 标题：统一格式 `## stepN …`。 */
-    private static final java.util.regex.Pattern STEP_HEADING_PATTERN =
-            java.util.regex.Pattern.compile("^step\\s*\\d", java.util.regex.Pattern.CASE_INSENSITIVE);
-
     private static final String TOOL_DESCRIPTION = """
-            发现与渐进式读取技能文档（list/count/search/get；get 可按大纲/段落/行范围读取）。
+            发现与渐进式读取技能文档（list/count/search/get；get 可按大纲 structure、段落 sectionHeading、行范围读取）。
+            技能正文结构约定：# 技能名 + ## stepN 步骤 + ### stepN.M 子步骤（步骤标识取自标题首词，如 step1 / step1.1）。
+            采用某技能时：先用 get 读取它（大纲返回技能名/版本与各步骤标题），把步骤标题里的标识（step1 / step1.1）与返回的 skillId
+            记进你的任务清单条目（todowrite 的 skillId/stepId 字段）；执行该步骤前再用
+            get(skillId=…, sectionHeading=stepId) 读取该节正文（H2 段落会连带返回其下 H3 子步骤）。
+            读取技能本身不会改动你的任务清单。
             """;
 
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
@@ -61,7 +55,6 @@ public class CapabilityBuiltinToolSkillLibrary implements CapabilityBuiltinToolS
     private final CapabilitySkillSpi skillSpi;
     private final InstanceCapabilitySpi instanceCapabilitySpi;
     private final SessionSpi sessionSpi;
-    private final SessionTodoSpi sessionTodoSpi;
 
     @Override
     public BuiltinToolEnum getToolType() {
@@ -236,11 +229,6 @@ public class CapabilityBuiltinToolSkillLibrary implements CapabilityBuiltinToolS
         String prompt = extractPromptTemplate(definition);
         int totalLines = prompt != null ? lineCount(prompt) : lineCount(definition);
 
-        // 用技能步骤（H2 `## stepN`）播种会话待办 —— 让"计划"只有一份权威：
-        // 技能给了步骤，就不再依赖模型自建任务清单（详见 RunnerConstants footer 与
-        // PROMPT_TODOLIST_* 的完成语义说明）。幂等：会话已有待办则不重建。
-        seedTodosFromSkill(ctx.getSessionId(), ctx.getRunId(), prompt);
-
         // Structure mode: 仅返回 promptTemplate 大纲（标题 + 行号）。
         if (Boolean.TRUE.equals(ctx.getStructure())) {
             if (prompt == null) {
@@ -286,53 +274,6 @@ public class CapabilityBuiltinToolSkillLibrary implements CapabilityBuiltinToolS
         r.setPreview(previewOf(definition));
         r.setTotalLines(totalLines);
         return r;
-    }
-
-    /**
-     * 用技能的 H2 步骤标题（`## stepN …`）播种会话待办。
-     *
-     * <p>为什么这样做：技能本身已经是"计划"（step0→step7 + 收尾对账）。若再让模型自建
-     * 一套 todo，就会出现**两套进度真相**，而 todo 的 {@code completed=完成} 语义更硬、注入更晚，
-     * 容易凌驾于技能的"收尾前必须对账"之上，甚至促成"提前收工"。这里把计划收敛到一份。
-     *
-     * <p>幂等策略：**会话已有待办就不播种** —— 既不冲掉模型可能已建立的清单，也不会
-     * 因反复 {@code get} 而反复重置进度。H3（`### stepN.M`）不进待办，它是按需读取的阅读单元
-     * （{@code extractSection} 读 H2 时会把其下 H3 一并返回）。
-     */
-    void seedTodosFromSkill(Long sessionId, Long runId, String prompt) {
-        if (sessionId == null || prompt == null || prompt.isBlank()) {
-            return;
-        }
-        try {
-            List<SessionTodoVO> existing = sessionTodoSpi.listBySession(sessionId);
-            if (existing != null && !existing.isEmpty()) {
-                return;
-            }
-            List<SessionTodoVO> todos = new ArrayList<>();
-            for (HeadingInfo h : MarkdownParser.parseHeadings(prompt)) {
-                if (h.getLevel() != 2) {
-                    continue;
-                }
-                String title = h.getText() == null ? "" : h.getText().trim();
-                if (!STEP_HEADING_PATTERN.matcher(title).find()) {
-                    continue; // 只播种步骤；渠道路由/附录等 H2 不进待办
-                }
-                String stepId = title.split("\\s+", 2)[0];
-                String content = title + "（执行前先 get(sectionHeading=\"" + stepId + "\")）";
-                if (content.length() > TODO_CONTENT_MAX) {
-                    content = content.substring(0, TODO_CONTENT_MAX);
-                }
-                todos.add(new SessionTodoVO(content, TODO_STATUS_PENDING, TODO_PRIORITY_MEDIUM));
-            }
-            if (todos.isEmpty()) {
-                return;
-            }
-            sessionTodoSpi.replaceAll(sessionId, runId, todos);
-            log.info("Seeded {} todos from skill steps for session {}", todos.size(), sessionId);
-        } catch (Exception e) {
-            // 播种失败不影响技能读取本身
-            log.warn("seedTodosFromSkill failed sessionId={}", sessionId, e);
-        }
     }
 
     private boolean isSkillBound(Long instanceId, Long skillId) {

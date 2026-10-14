@@ -65,7 +65,7 @@ class SkillHubServiceTest {
         s.setId(id);
         s.setName(name);
         s.setDescription("d");
-        s.setDefinition("{\"prompt\":\"p\"}");
+        s.setDefinition("{\"version\":1,\"parameters\":{\"type\":\"object\",\"properties\":{}},\"promptTemplate\":\"# S\\n\\n## step1 A\\n### step1.1 B\\np\"}");
         s.setStatus("ENABLED");
         s.setVisibility(visibility);
         s.setCreatedBy(createdBy);
@@ -149,7 +149,7 @@ class SkillHubServiceTest {
         com.buukle.agent.capability.skill.dtvo.dto.CreateSkillDTO dto =
                 new com.buukle.agent.capability.skill.dtvo.dto.CreateSkillDTO();
         dto.setName("a");
-        dto.setDefinition("{\"prompt\":\"p\"}");
+        dto.setDefinition("{\"version\":1,\"parameters\":{\"type\":\"object\",\"properties\":{}},\"promptTemplate\":\"# S\\n\\n## step1 A\\n### step1.1 B\\np\"}");
 
         BizException e = assertThrows(BizException.class, () -> service.updateSkill(1L, dto));
         assertEquals(CapabilitySkillErrorCode.SKILL_FORBIDDEN.getCode(), e.getErrorCode());
@@ -208,7 +208,7 @@ class SkillHubServiceTest {
         com.buukle.agent.capability.skill.dtvo.dto.CreateSkillDTO dto =
                 new com.buukle.agent.capability.skill.dtvo.dto.CreateSkillDTO();
         dto.setName("a");
-        dto.setDefinition("{\"prompt\":\"p\"}");
+        dto.setDefinition("{\"version\":1,\"parameters\":{\"type\":\"object\",\"properties\":{}},\"promptTemplate\":\"# S\\n\\n## step1 A\\n### step1.1 B\\np\"}");
 
         SkillVO vo = service.updateSkill(1L, dto);
 
@@ -228,7 +228,7 @@ class SkillHubServiceTest {
         com.buukle.agent.capability.skill.dtvo.dto.CreateSkillDTO dto =
                 new com.buukle.agent.capability.skill.dtvo.dto.CreateSkillDTO();
         dto.setName("a");
-        dto.setDefinition("{\"prompt\":\"p\"}");
+        dto.setDefinition("{\"version\":1,\"parameters\":{\"type\":\"object\",\"properties\":{}},\"promptTemplate\":\"# S\\n\\n## step1 A\\n### step1.1 B\\np\"}");
 
         SkillVO vo = service.updateSkill(1L, dto);
 

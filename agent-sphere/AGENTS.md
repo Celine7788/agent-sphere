@@ -135,6 +135,102 @@ copies from their origin skill. Replaces the old `SkillAutoUpdateSweeper`.
 - Manual trigger: `POST /api/v1/capability/skill/sync-now`; poll `GET /sync-runs/{id}`. Both mirrors of
   the session-cleanup endpoints, and the frontend reuses `useRecordedTask`.
 
+## wait 工具：挂起-恢复（不走常规工具路径）
+
+`wait`（`BuiltinToolEnum.WAIT(10)` / `builtin_10`）**不阻塞**。工具执行体只写一条
+`agent_pending_wait` 并立即返回 `{"status":"waiting"}`，SessionRunner 判定后 `break`
+退出循环，到点再唤醒。**形态照抄 `ask_clarification`：没有独立 maven 模块、没有
+`CapabilityBuiltinToolSpi` bean、没有 DB seed** —— 常量在 `WaitConstants`，手写 schema 与
+显式注册在 `ContextPreparer`，执行拦截在 `ToolExecutor`（排在 `executeBuiltinTool` 之前）。
+
+- **为什么必须挂起而不是 sleep。** 常规工具必须在一个 `tool.execution-timeout`（60s）的盒子里
+  跑完，「等超过 60s」因此不可满足。挂起后等待发生在超时盒子之外：不占虚拟线程、不占
+  `maxParallel:3` 信号量、不受 tool/step 超时约束。只有必要时才放宽全局超时 —— 别为单个
+  需求去改 `FiberSet` 的整批 deadline。
+- **`FiberSet` 一行都不用改。** 澄清已经证明这点：工具瞬间返回，挂起判定完全活在循环**之外**。
+  `SuspenseStatusResolver` 是唯一的判定入口。
+- **判定必须结构化解析。** 旧写法 `toolResult.contains("\"status\":\"awaiting_user\"")`
+  依赖序列化后的字段顺序与字面量，改一次编码方式就会静默失效 —— 挂起不触发，run 拿着
+  一条「等你回答」的结果继续空转，比报错难查得多。解析失败一律返回 `null`（不挂起）。
+- **唤醒有两条路径，靠 CAS 保证只恢复一次。** 主路径 `PendingWaitWakeScheduler`（每条记录一个
+  内存定时器），补偿路径 `WaitWakeTask`（cron，Redisson 锁 `scheduler:pending-wait`）。副本重启
+  会丢光内存定时器。两者都先 `PendingWaitSpi#claimForResume` 做
+  `UPDATE ... WHERE status='PENDING'` —— **必须是单条条件 UPDATE**，不能「先 select 再 update」，
+  否则并发下双双通过检查。
+- **跨模块只走 Spring 本地事件。** kernel（`ToolExecutor`）只能依赖 instance-spi，而恢复 run 的
+  `ChatRuntimeService#resumeFromWait` 在 orchestration —— 依赖方向是 orchestration → kernel，
+  反向调用会成环。故 `PendingWaitService` 发 `PendingWaitCreatedEvent`，由
+  `PendingWaitWakeScheduler` 监听。run 是「单写者（本执行副本）」语义，本地定时器即够。
+- **`loopCount` 必须持久化（V82 `agent_run.loop_count`）。** 它此前是 `runInternal` 的局部变量，
+  每次挂起恢复都归零，于是 `maxLoopCount` 只约束「单次调用」—— 模型可反复挂起无限续命
+  （澄清现在也有这个洞，V82 一并修掉）。恢复时从 `currentRun.getLoopCount()` 起步；
+  自增随循环顶部那次已有的 `updateRun` 一并落库，不额外增加写。
+  `RunConverter` 是手写的，**加字段必须两边都改**，漏了不会报错、只会让护栏静默失效。
+- **子 Agent 工具集必须剔除 `wait`**（`SessionSubRunner#filterTools`）。挂起判定只在主循环有；
+  放行的话 `ToolExecutor` 仍会建 pending 记录并返回 `{"status":"waiting"}`，却没人认领 ——
+  变成一次静默的空等。
+- **`RunStatus.WAITING` 不能进终态白名单。** 前端 `PULL_TRIGGER_SUB_TYPES` 加它（要刷新显示
+  「等待中」），但 `RUN_TERMINAL_SUB_TYPES` **不加** —— 加进去会让等待期间就解锁输入框。
+  与 `AWAITING_USER` 分开正是为了区分「等时间」和「等人」。
+- **等待不保证就绪。** `WAIT_RESUME_PREFIX` 与工具描述都强制模型醒来先 `getContent` 复核，
+  且不得重复同一次 wait —— 沿用 `getContent(mode:ready)` 那套「等完必须复核」的经验。
+- **`WAITING` 是一个真正的 run 状态，必须进整套状态机**（这份清单漏一处就静默失效，
+  曾导致「停止按钮在等待时无效」）：
+  `RunEnum.STATUS_WAITING` / `RunServiceImpl.findActiveRun`（否则 stopSession 走「无活动 run」
+  分支，清掉刚设的取消标志、什么都不取消）/ `ChatRuntimeService.stopSession`+`stopRun`
+  （停车态与 `AWAITING_USER` 同构：置 `CANCELLED` + `PendingWaitSpi.cancelPendingByRunId`
+  取消挂起 + 发 `run_cancelled`）/ `RuntimeEventListener.handleRunLifecycle` /
+  `TimelineRecorder.recordRunTerminal`（`default -> throw`，漏了直接抛）/
+  `SessionCleanupTask` 活跃守卫。停车态的 loop 已退出，**取消标志没有消费者** ——
+  停止必须「直接置终态 + 发事件」，不能只设标志等 loop 消费。
+- **取消发 `RunStatus.CANCELLED`，不是 `FAILED`**（循环收口处）：旧实现发 FAILED，
+  监听器又会把 DB 覆写回 FAILED，于是「取消」被记成「失败」。
+- `OrphanRunSweeper` 把孤儿 run 置 FAILED 时必须**同时发终态事件**，否则该会话 timeline
+  永久停在运行中，只有刷新才一致。
+
+## 技能与待办（skill ↔ todo）——单向、模型主导
+
+**读技能是纯读，绝不改动待办。** 旧 `seedTodosFromSkill`（技能 `get` 时把 H2 步骤写进
+`agent_session_todo`）已删除：它在「只是看一眼技能」时就替换掉模型已建的计划，而且是
+不可见的副作用（写的是表，模型看的却是另一个源）。不要再把任何「读技能 → 建计划」的隐式
+联动加回来。
+
+- **待办是唯一的计划载体，由模型用 `todowrite` 维护。** 无技能时模型自建；技能即整份计划时
+  按 `## stepN`/`### stepN.M` 铺成 `N. 标题`/`N.M 标题`；技能只是某几步的方法时**保留原计划**、
+  只补来源字段。三场景与文化口径写在 `RunnerConstants.PROMPT_TOOLS_FOOTER` 与
+  `CapabilityBuiltinToolTodowrite.TOOL_DESCRIPTION`，**改文案要三处对齐**（footer、
+  `PROMPT_TODOLIST_INSTRUCTION`、两个工具 description）。
+- **技能来源是结构化字段，不是文本。** `todowrite` 条目的 `skillId`(Long)/`stepId`(String)，
+  落到 `agent_session_todo.skill_id/step_id`（V84）。执行该条目时模型用
+  `skill_library(action=get, skillId=…, sectionHeading=stepId)` 回查正文（`headingMatches` 是
+  大小写不敏感子串匹配，H2 段会连带返回其 H3 子项）。**`stepId` 存标题里的原始标识**（`step1`）。
+- **技能槽（`PROMPT_SKILL_SLOT_HEADER` / `loadSkillSlotText` / `applySkillSlot`）已整体移除。**
+  「技能地图」的角色并入待办槽——待办槽本就是受保护、每轮原位刷新的尾部 system 段，注解随它常驻。
+  这也顺手解决了旧技能槽的两个坑（只认最近一个技能；`list`/`search` 会清空槽）。
+- **`todowrite` 是整体替换**（`SessionTodoServiceImpl.replaceAll` 先删后插）：模型每次必须回传
+  **完整清单**，否则漏传的条目被删。`persistTodosFromResult`（tool 结果 → 表）与
+  `applyTodolistSuffix`（tool 结果 artifact → 提示词待办槽）是两个消费端，各自保留。
+- **多技能无需聚合**：每个条目自带来源指针，不再依赖「当前技能是谁」。
+
+## 技能结构规范（create/update 强制校验）
+
+技能 `definition` 的 `promptTemplate` 必须是固定标题结构：`# <技能名>`（有且仅有一个 H1）
++ `## stepN <步骤名>`（至少一个）+ `### stepN.M <子步骤名>`（挂在同编号的 `## stepN` 之下），
+且不得层级跳跃。
+
+- **校验只有一处实现**：`common` 的 `SkillTemplateValidator`（返回 `null` 或「违规清单 + 标准模板」）。
+  **唯一强制点是 service** `CapabilitySkillServiceImpl#validateDefinition`（create/update 都调它），
+  失败抛 `BizException(PARAM_INVALID, …)`。
+- **两条入口都经过 service**：UI 表单走 `CapabilitySkillController` → service；agent 工具
+  `CapabilityBuiltinToolSkillManage` → `skillSpi.createSkill/updateSkill` → service。因此
+  **不要在工具里另加一份结构校验**（工具已委托同一个 validator，避免口径漂移）。
+- **强校验含 legacy**：旧 `{"prompt":...}` 定义（无标题结构）同样被拒。故**默认资源模板里的
+  「示例技能」必须合规**——`SkillInitializer` 会读它开户初始化；旧 seed 已在 **V85** 幂等改写为
+  含合规 `promptTemplate` 的模板（改 `agent_system_config.user.resource-template`，勿改 V62/V63）。
+- 已存在的 legacy 技能副本无法再 update/append，须先规范化 —— 有意为之。
+- 模板三处保持一致：后端 `SkillTemplateValidator.SKILL_TEMPLATE`、工具 `TOOL_DESCRIPTION`（引用它）、
+  前端 `agent-sphere-ui/src/pages/capabilities/skill/index.tsx` 的 `SKILL_TEMPLATE`/`SAMPLE_DEFINITION`。
+
 ## Conventions
 
 - JVM default + Jackson timezone: `Asia/Shanghai` (set in `Application.java` and `application.yml`).
@@ -147,6 +243,7 @@ copies from their origin skill. Replaces the old `SkillAutoUpdateSweeper`.
 
 - Avoid `Map` as a method input parameter. Use typed DTOs/POJOs so signatures, validation, and refactoring stay explicit. A generic `Map<String, Object>` is only acceptable at framework boundaries (e.g. MyBatis result maps, HTTP param bags) and must be converted to a typed object at the earliest layer.
 - No magic values. Reuse existing constants/enums by scope before introducing new ones: method-local → `private static final` on the class → module-wide constants class / `enum`. Only declare a new constant when no suitable one exists in the relevant scope. Never inline raw numbers or strings inside business logic.
+- **No third-party brands** (see the root `AGENTS.md`): never reference the brand or domain of a third-party site we automate in code, comments, Javadoc, logs, docs or tests. Use neutral placeholders (`example.com`) or generalize the matching feature. **Applied Flyway migrations must not be edited** to scrub a seed — add a new migration instead.
 
 ## Git
 

@@ -1,10 +1,6 @@
 package com.buukle.agent.runtime.kernel.runner;
 
 import com.buukle.agent.capability.builtin.dtvo.enums.BuiltinToolEnum;
-import com.buukle.agent.capability.skill.dtvo.vo.SkillVO;
-import com.buukle.agent.capability.skill.spi.CapabilitySkillSpi;
-import com.buukle.agent.common.skill.SkillDefinition;
-import com.buukle.agent.common.skill.SkillDefinitionParser;
 import com.buukle.agent.common.config.AgentRuntimeProperties;
 import com.buukle.agent.common.context.TaskLoopLimitHolder;
 import com.buukle.agent.common.eventbus.DistributedRuntimeConstants;
@@ -25,6 +21,7 @@ import com.buukle.agent.runtime.kernel.config.FallbackRouteExecutor;
 import com.buukle.agent.runtime.kernel.config.LlmRequestConfigurer;
 import com.buukle.agent.runtime.kernel.config.RouteListBuilder;
 import com.buukle.agent.runtime.kernel.constants.ChatClarification;
+import com.buukle.agent.runtime.kernel.constants.WaitConstants;
 import com.buukle.agent.runtime.kernel.constants.LlmApiConstant;
 import com.buukle.agent.runtime.kernel.constants.RunnerConstants;
 import com.buukle.agent.runtime.kernel.constants.RuntimeEventTypeConstant;
@@ -83,7 +80,6 @@ public class SessionRunner {
     private final ToolExecutor toolExecutor;
     private final TitleService titleService;
     private final AgentToolCallRecordSpi toolCallRecordSpi;
-    private final CapabilitySkillSpi skillSpi;
     private final RedissonClient redissonClient;
     private final ChatAttachmentResolver attachmentResolver;
     private final LlmRequestConfigurer llmRequestConfigurer;
@@ -172,10 +168,13 @@ public class SessionRunner {
     }
 
     private void runInternal(Long sessionId) {
-        int loopCount = 0;
         Long currentRunId = redissonClient.<Long>getBucket(
                 DistributedRuntimeConstants.sessionPendingRunKey(sessionId)).getAndDelete();
         RunVO currentRun = currentRunId != null ? runSpi.getRun(currentRunId) : null;
+        // 从 run 已持久化的计数起步（V82 起）。挂起恢复（澄清/等待）会重进本方法，
+        // 若仍从 0 起算，maxLoopCount 只约束「单次调用」—— 模型可反复挂起无限续命。
+        int loopCount = currentRun != null && currentRun.getLoopCount() != null
+                ? currentRun.getLoopCount() : 0;
         List<ChatMessageDTO> messages = new ArrayList<>();
         boolean hasToolCalls = false;
         StringBuilder allContent = new StringBuilder();
@@ -214,6 +213,10 @@ public class SessionRunner {
             }
 
             currentRun.setStatus(RunStatus.RUNNING.name());
+            // 随这次状态更新一并落库（不额外增加写）：loopCount 在本轮末尾自增，
+            // 挂起 break 发生在自增之前，所以这里记的正是「本轮即将执行的序号」，
+            // 恢复后从该值续跑不会重复或漏计。
+            currentRun.setLoopCount(loopCount);
             runSpi.updateRun(currentRun);
 
             eventPublisher.publishEvent(new RuntimeEventVO(RunStatus.RUNNING,
@@ -248,9 +251,6 @@ public class SessionRunner {
                         .setContent(runPromptBuilder.currentTimeText()));
                 // 待办列表独立为尾部 system 段（原位替换，不触碰 index 0，保持前缀缓存稳定）
                 applyTodolistSuffix(messages, todolistText);
-                // 技能槽：首次装配时通常还没读技能（返回 null → 不加槽），
-                // 待模型调用 skill_library 后会在此后的轮次刷新出来。
-                applySkillSlot(messages, loadSkillSlotText(sessionId));
             }
 
             List<RuntimeTool> tools = ctx != null ? ctx.getTools() : List.of();
@@ -307,9 +307,6 @@ public class SessionRunner {
                                 .setRole(LlmApiConstant.ROLE_SYSTEM)
                                 .setContent(runPromptBuilder.currentTimeText()));
                         applyTodolistSuffix(messages, todolistText);
-                // 技能槽：首次装配时通常还没读技能（返回 null → 不加槽），
-                // 待模型调用 skill_library 后会在此后的轮次刷新出来。
-                applySkillSlot(messages, loadSkillSlotText(sessionId));
                         hasToolCalls = true;
                         continue;
                     }
@@ -455,19 +452,21 @@ public class SessionRunner {
                 break;
             }
 
-            // Detect clarification (awaiting_user) — pause run instead of looping back to LLM
-            boolean awaitingUser = false;
+            // 挂起判定：澄清（等人）与 wait（等时间）都让本轮 break 退出而不是回喂模型。
+            // 结构化解析 status，不再用 contains("\"status\":\"awaiting_user\"")：
+            // 那种写法依赖序列化后的字段顺序与字面量，改一次编码方式就会静默失效，
+            // 挂起不触发 → run 空转。
+            RunStatus suspendStatus = null;
             for (TurnToolCall tc : turn.toolCalls()) {
-                String toolResult = results.getOrDefault(tc.id(), "");
-                if (ChatClarification.CLARIFICATION_TOOL_NAME.equals(tc.name()) && toolResult.contains("\"status\":\"awaiting_user\"")) {
-                    awaitingUser = true;
+                suspendStatus = SuspenseStatusResolver.resolve(tc.name(), results.getOrDefault(tc.id(), ""));
+                if (suspendStatus != null) {
                     break;
                 }
             }
-            if (awaitingUser) {
-                currentRun.setStatus(RunStatus.AWAITING_USER.name());
+            if (suspendStatus != null) {
+                currentRun.setStatus(suspendStatus.name());
                 runSpi.updateRun(currentRun);
-                eventPublisher.publishEvent(new RuntimeEventVO(RunStatus.AWAITING_USER,
+                eventPublisher.publishEvent(new RuntimeEventVO(suspendStatus,
                         new RuntimeEventDataVO()
                                 .setSessionId(sessionId)
                                 .setRunId(currentRunId)
@@ -515,14 +514,6 @@ public class SessionRunner {
                 }
             }
 
-            // 技能被读取后，刷新受保护的「技能槽」（技能名/版本 + 大纲），
-            // 使其跨 run 常驻，避免大技能正文被历史压缩砍掉后模型丢规则。
-            boolean skillLibraryCalled = turn.toolCalls().stream().anyMatch(tc ->
-                    tc.name().equals(InstanceCapabilityEnum.LLM_PREFIX_BUILTIN + BuiltinToolEnum.SKILL_LIBRARY.getId()));
-            if (skillLibraryCalled && !messages.isEmpty()) {
-                applySkillSlot(messages, loadSkillSlotText(sessionId));
-            }
-
             // 最后一轮工具执行后，直接结束
             if (isLastLoop) {
                 markLoopCapped(currentRun, maxLoopCount);
@@ -561,7 +552,9 @@ public class SessionRunner {
         if ((runCancelled || sessionCancelled) && currentRun != null) {
             currentRun.setStatus(RunStatus.CANCELLED.name());
             runSpi.updateRun(currentRun);
-            eventPublisher.publishEvent(new RuntimeEventVO(RunStatus.FAILED,
+            // 发 CANCELLED（而非 FAILED）：与 DB 状态一致，前端走 run_cancelled 分支显示“已取消”。
+            // 旧实现发 FAILED，RuntimeEventListener 收到后又把 DB 覆写回 FAILED —— 取消被记成失败。
+            eventPublisher.publishEvent(new RuntimeEventVO(RunStatus.CANCELLED,
                     new RuntimeEventDataVO()
                             .setSessionId(sessionId)
                             .setRunId(currentRunId)
@@ -618,74 +611,6 @@ public class SessionRunner {
                 .setContent(suffix));
     }
 
-    /** 技能大纲用的标题行（#/##/###…）与 skillId 抽取。 */
-    private static final java.util.regex.Pattern SKILL_HEADING =
-            java.util.regex.Pattern.compile("^(#{1,6})\\s+(.+)$");
-    private static final java.util.regex.Pattern SKILL_ID_ARG =
-            java.util.regex.Pattern.compile("\"skillId\"\\s*:\\s*(\\d+)");
-
-    /**
-     * 组装「技能槽」文本：本任务已读取的技能名/版本 + 大纲（H2/H3 + 行号）。
-     *
-     * <p>目的有二：
-     * <ol>
-     *   <li><b>抗压缩</b>：大技能正文跨 run 重放时会被 {@code ToolResultCompressor} 按 2000 字符
-     *       压成"头 100 + 尾 50"，模型会丢规则；把<b>大纲</b>放进受保护槽每轮原位刷新即可常驻，
-     *       正文改为按需 {@code get(sectionHeading=…)} 小片段读取；</li>
-     *   <li><b>可验证</b>：槽里写明用了哪个技能（名+版本），配合 {@code agent_tool_call_record}
-     *       可以核对"是否真的读了技能"。</li>
-     * </ol>
-     *
-     * <p>任何异常都吞掉返回 null —— 技能槽缺省不能影响主流程。
-     */
-    private String loadSkillSlotText(Long sessionId) {
-        if (sessionId == null) {
-            return null;
-        }
-        try {
-            AgentToolCallRecordVO rec = toolCallRecordSpi.getLatestBySessionAndToolName(
-                    sessionId, InstanceCapabilityEnum.LLM_PREFIX_BUILTIN + BuiltinToolEnum.SKILL_LIBRARY.getId());
-            if (rec == null || rec.getArgumentsJson() == null) {
-                return null;
-            }
-            java.util.regex.Matcher m = SKILL_ID_ARG.matcher(rec.getArgumentsJson());
-            if (!m.find()) {
-                return null;
-            }
-            Long skillId = Long.valueOf(m.group(1));
-            SkillVO skill = skillSpi.getSkill(skillId);
-            if (skill == null) {
-                return null;
-            }
-            StringBuilder sb = new StringBuilder();
-            sb.append("技能：").append(skill.getName() == null ? ("#" + skillId) : skill.getName());
-            if (skill.getVersion() != null) {
-                sb.append(" (v").append(skill.getVersion()).append(')');
-            }
-            sb.append('\n');
-            String prompt = promptTemplateOf(skill.getDefinition());
-            if (prompt != null) {
-                String[] lines = prompt.split("\n", -1);
-                for (int i = 0; i < lines.length; i++) {
-                    java.util.regex.Matcher h = SKILL_HEADING.matcher(lines[i]);
-                    if (h.matches()) {
-                        int level = h.group(1).length();
-                        if (level <= 3) { // H1 太长（技能名），H2/H3 是步骤与子步骤
-                            sb.append("  ".repeat(Math.max(0, level - 1)))
-                              .append("- ").append(h.group(2).trim())
-                              .append("  (L").append(i + 1).append(")\n");
-                        }
-                    }
-                }
-            }
-            sb.append("执行某步骤前，先 get(sectionHeading=\"stepN\") 读取该节正文（含其下全部子步骤）。");
-            return sb.toString();
-        } catch (Exception e) {
-            log.warn("loadSkillSlotText failed sessionId={}", sessionId, e);
-            return null;
-        }
-    }
-
     /**
      * P5：技能执行一致性（**仅日志**，不写 remark/stopReason）。
      *
@@ -737,49 +662,6 @@ public class SessionRunner {
                 || args.contains("\"action\":\"key\"")
                 || args.contains("\"action\":\"hover\"")
                 || args.contains("\"action\":\"clickAt\"");
-    }
-
-    private static String promptTemplateOf(String definition) {
-        try {
-            SkillDefinition def = SkillDefinitionParser.parse(definition);
-            return def == null ? null : def.promptTemplate();
-        } catch (Exception e) {
-            return null;
-        }
-    }
-
-    /** 技能槽的注入/刷新/删除，与 {@link #applyTodolistSuffix} 同构。 */
-    private void applySkillSlot(List<ChatMessageDTO> messages, String skillSlotText) {
-        if (messages == null) {
-            return;
-        }
-        String suffix = runPromptBuilder.buildSkillSlotSuffix(skillSlotText);
-        int existingSlot = -1;
-        for (int i = 0; i < messages.size(); i++) {
-            Object content = messages.get(i).getContent();
-            if (content instanceof String s && runPromptBuilder.isSkillSlot(s)) {
-                existingSlot = i;
-                break;
-            }
-        }
-        if (suffix == null) {
-            if (existingSlot >= 0) {
-                messages.remove(existingSlot);
-            }
-            return;
-        }
-        if (existingSlot >= 0) {
-            messages.get(existingSlot).setContent(suffix);
-            return;
-        }
-        int insertAt = messages.size();
-        Object last = messages.get(messages.size() - 1).getContent();
-        if (last instanceof String s && RunnerConstants.FINAL_TURN_INSTRUCTION.equals(s)) {
-            insertAt = messages.size() - 1;
-        }
-        messages.add(insertAt, new ChatMessageDTO()
-                .setRole(LlmApiConstant.ROLE_SYSTEM)
-                .setContent(suffix));
     }
 
     private TurnResult runTurn(Long sessionId, Long runId, List<ChatMessageDTO> messages,

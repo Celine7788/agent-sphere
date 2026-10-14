@@ -67,9 +67,11 @@ public class SessionCleanupTask extends AbstractRecordedTask<SessionCleanupRepor
     private static final int DEFAULT_RETENTION_DAYS = 7;
     private static final int DEFAULT_FILE_RETENTION_DAYS = 7;
 
-    /** 活跃 run：正在跑，删了等于毁掉进行中的会话。 */
+    /** 活跃 run：正在跑，删了等于毁掉进行中的会话。
+     *  含 {@code WAITING}（wait 挂起，到点会自动续跑 —— 与 AWAITING_USER「等人可能永不回」不同，
+     *  它是真正在途的状态，必须守卫）。 */
     private static final List<String> ACTIVE_RUN_STATUSES =
-            List.of(RunEnum.STATUS_PENDING, RunEnum.STATUS_RUNNING);
+            List.of(RunEnum.STATUS_PENDING, RunEnum.STATUS_RUNNING, RunEnum.STATUS_WAITING);
 
     /** 活跃 task：Bole 开放层长任务只更新 task/run 行、不更新 session 行，必须单独守卫。 */
     private static final List<String> ACTIVE_TASK_STATUSES =

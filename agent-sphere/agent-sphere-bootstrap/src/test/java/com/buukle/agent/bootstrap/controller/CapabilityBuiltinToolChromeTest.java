@@ -79,22 +79,22 @@ class CapabilityBuiltinToolChromeTest {
      * executeJS 只读闸：所有导航写操作必须在**工具层**被拒，且**不发命令**。
      *
      * <p>这是线上风控的直接对策 —— 脚本式跳转（尤其 location.href 与 history.back）
-     * 绕过真实点击链路，是猎聘判异常触发 safe.liepin.com 验证码的主因。
+     * 绕过真实点击链路，是一些站点判异常触发风控验证页的主因。
      */
     @Test
     void executeJs_navigationWrites_allBlockedWithoutPublish() {
         String[] codes = {
-                "location.href='https://h.liepin.com/resume/showresumedetail/?res_id_encode=X'",
-                "location['href']='https://h.liepin.com/x'",
-                "location.assign('https://h.liepin.com/x')",
-                "location.replace('https://h.liepin.com/x')",
+                "location.href='https://host.example/resume/showresumedetail/?res_id_encode=X'",
+                "location['href']='https://host.example/x'",
+                "location.assign('https://host.example/x')",
+                "location.replace('https://host.example/x')",
                 "location.reload()",
-                "document.location='https://h.liepin.com/x'",
-                "window.location.href='https://h.liepin.com/x'",
-                "top.location='https://h.liepin.com/x'",
+                "document.location='https://host.example/x'",
+                "window.location.href='https://host.example/x'",
+                "top.location='https://host.example/x'",
                 "history.back()",
                 "history.pushState({}, '', '/x')",
-                "window.open('https://h.liepin.com/x')",
+                "window.open('https://host.example/x')",
                 "document.forms[0].submit()",
                 "location.hash = '#a'",
         };
@@ -159,27 +159,17 @@ class CapabilityBuiltinToolChromeTest {
     }
 
     @Test
-    void injectFailed_autoRetriesOnce() {
+    void injectFailed_returnsImmediatelyWithoutRetry() {
+        // 工具层已去掉 inject_failed 自动重发：单发一条命令，如实回报注入失败。
+        // 第二条（ok）回调故意留着：若仍会自动重发，它会被消费并让结果变为成功。
         callbacks.add(fail("inject_failed"));
-        callbacks.add(ChromeCallbackDTO.ok("cmd", "retried-ok"));
-
-        ChromeResultVO vo = (ChromeResultVO) tool.execute(exec("getContent", ".geek-info-card"));
-
-        assertTrue(vo.isSuccess());
-        assertEquals("retried-ok", vo.getData());
-        verify(publisher, org.mockito.Mockito.times(2)).publishEvent(any(ChromeCommandDTO.class));
-    }
-
-    @Test
-    void injectFailed_stillFailsAfterRetry() {
-        callbacks.add(fail("inject_failed"));
-        callbacks.add(fail("inject_failed"));
+        callbacks.add(ChromeCallbackDTO.ok("cmd", "should-not-be-used"));
 
         ChromeResultVO vo = (ChromeResultVO) tool.execute(exec("getContent", ".x"));
 
         assertFalse(vo.isSuccess());
         assertEquals("inject_failed", vo.getErrorCategory());
-        verify(publisher, org.mockito.Mockito.times(2)).publishEvent(any(ChromeCommandDTO.class));
+        verify(publisher, org.mockito.Mockito.times(1)).publishEvent(any(ChromeCommandDTO.class));
     }
 
     @Test

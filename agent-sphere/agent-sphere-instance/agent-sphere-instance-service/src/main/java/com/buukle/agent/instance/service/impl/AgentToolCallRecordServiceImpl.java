@@ -96,6 +96,20 @@ public class AgentToolCallRecordServiceImpl implements AgentToolCallRecordSpi {
     }
 
     @Override
+    public AgentToolCallRecordVO getByRunAndCallId(Long runId, String callId) {
+        if (runId == null || callId == null || callId.isBlank()) {
+            return null;
+        }
+        AgentToolCallRecord r = mapper.selectOne(
+                new LambdaQueryWrapper<AgentToolCallRecord>()
+                        .eq(AgentToolCallRecord::getRunId, runId)
+                        .eq(AgentToolCallRecord::getCallId, callId)
+                        .orderByDesc(AgentToolCallRecord::getId)
+                        .last("LIMIT 1"));
+        return r != null ? toVO(r) : null;
+    }
+
+    @Override
     public AgentToolCallRecordVO getLatestBySessionAndToolName(Long sessionId, String toolName) {
         AgentToolCallRecord r = mapper.selectOne(
                 new LambdaQueryWrapper<AgentToolCallRecord>()

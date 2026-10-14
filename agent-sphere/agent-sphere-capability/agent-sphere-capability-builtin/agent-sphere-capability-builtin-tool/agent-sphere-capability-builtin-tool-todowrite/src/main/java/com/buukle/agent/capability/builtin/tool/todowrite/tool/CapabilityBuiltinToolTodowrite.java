@@ -22,16 +22,21 @@ public class CapabilityBuiltinToolTodowrite implements CapabilityBuiltinToolSpi 
     static final String STATUS_PENDING = "pending";
     static final String PRIORITY_MEDIUM = "medium";
     static final String TOOL_DESCRIPTION = """
-            Create and maintain a structured task list for the current task.
-            If a skill drives this task, its steps are already the plan (and may be
-            pre-seeded into this list) — do NOT build a second list; just update statuses.
-            Otherwise call this tool at the start to lay out the work.
-            Call it again whenever a task's status changes (pending → in_progress →
-            completed / cancelled). Mark a task in_progress BEFORE working on it (max one
-            at a time), and completed ONLY after the work is done AND verified. If blocked,
-            keep it in_progress and add a follow-up todo.
-            NOTE: a completed list is PROGRESS ONLY — it does not by itself finish the task;
-            completion follows the task instructions / the skill's closing conditions.""";
+            Create and maintain the SINGLE task list for the current task.
+            Call it at the start to lay out the work, and again whenever a task's status changes
+            (pending → in_progress → completed / cancelled). Mark a task in_progress BEFORE working
+            on it (max one at a time), and completed ONLY after the work is done AND verified.
+
+            If a skill drives this task, its steps ARE the plan: read the skill (skill_library) and
+            write ONE item per step, keeping their order — do NOT build a second, divergent list.
+            For items that come from a skill, also set `skillId` (the skill id) and `stepId` (the
+            step id such as step1 / step1.1); before executing such an item, read its body with
+            skill_library(action=get, skillId=…, sectionHeading=stepId). If a skill only details a
+            few steps of your existing plan, KEEP that list and just annotate those items.
+
+            This tool REPLACES the entire list — always pass the COMPLETE list; omitted items are deleted.
+            NOTE: a completed list is PROGRESS ONLY — it does not by itself finish the task; completion
+            follows the task instructions / the skill's closing conditions and expected output.""";
 
     @Override
     public BuiltinToolEnum getToolType() {
@@ -76,7 +81,9 @@ public class CapabilityBuiltinToolTodowrite implements CapabilityBuiltinToolSpi 
                 resultTodos.add(new TodowriteResultVO.TodoItemVO(
                         item.getContent() != null ? item.getContent() : "",
                         item.getStatus() != null ? item.getStatus() : STATUS_PENDING,
-                        item.getPriority() != null ? item.getPriority() : PRIORITY_MEDIUM));
+                        item.getPriority() != null ? item.getPriority() : PRIORITY_MEDIUM,
+                        item.getSkillId(),
+                        item.getStepId()));
             }
         }
         return new TodowriteResultVO(resultTodos);

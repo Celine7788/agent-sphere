@@ -43,6 +43,10 @@ const PULL_TRIGGER_SUB_TYPES = [
   'run_failed',
   'run_cancelled',
   'run_awaiting_user',
+  // wait 挂起：到点会自行恢复同一个 run，需要拉一次让前端显示「等待中」。
+  // 故意不在 RUN_TERMINAL_SUB_TYPES 里 —— 它不是终态，加进去会让等待期间
+  // 就解锁输入框，等同于把「等时间」误报成「任务结束」。
+  'run_waiting',
   'tool_call_succeeded',
   'tool_call_failed',
 ];
@@ -459,6 +463,10 @@ export function useTimelineStream(api: ApiClient): TimelineStream {
 
       // 事件驱动 runActive：run_running/主助手打字机=在跑；终态=结束
       if (tlSubType === 'run_running') {
+        setRunActiveState(true);
+      } else if (tlSubType === 'run_waiting') {
+        // wait 挂起期间 run 仍在进行，到点自行恢复 —— 保持锁定。
+        // 断线重连正好落在等待窗口时靠这条把 runActive 重新立起来。
         setRunActiveState(true);
       } else if (
         (RUN_TERMINAL_SUB_TYPES as readonly string[]).includes(tlSubType)

@@ -339,6 +339,25 @@ export default function Chat() {
     } while (more && ++round < MAX_ROUNDS);
   };
 
+  // 按最新 run 状态行校准发送锁。SSE 断连窗口内若丢了 run 终态事件，sending 会一直卡在
+  // true（此前只能刷新页面恢复）；重连后拉一次权威状态即可解锁。
+  // 停车态判定：RUNNING/PENDING/WAITING 仍锁定；终态与 AWAITING_USER 解锁
+  // （AWAITING_USER 由澄清卡接管，输入框应可用来作答）。
+  const reconcileSendLock = async (sid: number) => {
+    try {
+      const page = await agentApi.sessions.getTimeline(sid, { limit: 30 });
+      if (currentSessionIdRef.current !== sid) return;
+      const rows = Array.isArray(page?.rows) ? page.rows : [];
+      const runRows = rows.filter((r: any) => r.kind === 'run_status');
+      const last = runRows[runRows.length - 1];
+      if (!last) return;
+      const st = String(last.state || '');
+      setSending(st === 'RUNNING' || st === 'PENDING' || st === 'WAITING');
+    } catch {
+      /* ignore */
+    }
+  };
+
   // 工具事件后的整页覆盖刷新：按 seq 覆盖同 seq 行，补齐迟到落库的 content（如截图 images）。
   // afterSeq 增量会跳过 seq ≤ newest 的既有行（工具行），导致 live 阶段看不到截图；此处拉尾窗覆盖修正。
   const refreshTail = async (sid: number) => {
@@ -582,9 +601,16 @@ export default function Chat() {
       token,
       {
         onOpen: () => {
+          const wasReconnect = reconnectCountRef.current > 0;
           setSseConnected(true);
           reconnectCountRef.current = 0;
           console.log('[SSE] connected');
+          if (wasReconnect) {
+            // 重连：补拉断连窗口内丢失的行，并按权威 run 状态校准发送锁，
+            // 否则丢终态事件会让发送/停止永久锁死（只能刷新页面恢复）。
+            void refreshLatest(sid);
+            void reconcileSendLock(sid);
+          }
         },
         onMessage: (payload) => {
           try {
@@ -655,7 +681,10 @@ export default function Chat() {
               }
             } else if (
               tlSubType === 'run_running' ||
-              tlSubType === 'run_pending'
+              tlSubType === 'run_pending' ||
+              // wait 挂起：run 并未结束，到点会自行恢复，输入框应保持锁定。
+              // 断线重连恰好落在等待窗口内时，靠这条把 sending 重新立起来。
+              tlSubType === 'run_waiting'
             ) {
               setSending(true);
             }
@@ -700,6 +729,7 @@ export default function Chat() {
                 'run_failed',
                 'run_cancelled',
                 'run_awaiting_user',
+                'run_waiting',
                 'tool_call_succeeded',
                 'tool_call_failed',
               ].includes(tlSubType) ||
@@ -1422,7 +1452,13 @@ export default function Chat() {
                 if (currentSession?.id) {
                   agentApi.runs
                     .sessionStop(currentSession.id)
-                    .catch(() => console.warn('session stop failed'));
+                    .catch((e: any) => {
+                      // 不再静默吞错：会话归属校验失败(FORBIDDEN)等会让“停止”看起来毫无反应。
+                      console.warn('session stop failed', e);
+                      message.error(
+                        e?.message ? `停止失败：${e.message}` : '停止失败，请重试',
+                      );
+                    });
                 }
               }}
               onCancelClarification={handleCancelClarification}

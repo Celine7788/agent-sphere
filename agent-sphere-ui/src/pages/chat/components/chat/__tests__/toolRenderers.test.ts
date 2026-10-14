@@ -54,8 +54,22 @@ describe('toolRenderers', () => {
         content: 'a',
         status: 'completed',
         priority: 'high',
+        skillId: null,
+        stepId: null,
       });
       expect(todos[1].status).toBeUndefined();
+    });
+
+    it('keeps skill provenance fields for skill-sourced items', () => {
+      const todos = extractTodos({
+        args: JSON.stringify({
+          todos: [
+            { content: '1. 打开页面', status: 'pending', priority: 'medium', skillId: 123, stepId: 'step1' },
+          ],
+        }),
+      });
+      expect(todos[0].skillId).toBe(123);
+      expect(todos[0].stepId).toBe('step1');
     });
 
     it('returns empty array for invalid payloads', () => {

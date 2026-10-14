@@ -7,10 +7,12 @@ import com.buukle.agent.common.mcp.TaskMcpCredentialStore;
 import com.buukle.agent.instance.dtvo.dto.TodowriteResultDTO;
 import com.buukle.agent.instance.dtvo.vo.SessionTodoVO;
 import com.buukle.agent.instance.spi.ClarificationSpi;
+import com.buukle.agent.instance.spi.PendingWaitSpi;
 import com.buukle.agent.instance.spi.SessionTodoSpi;
 import com.buukle.agent.runtime.kernel.constants.ChatClarification;
 import com.buukle.agent.runtime.kernel.constants.ExecBindingKeys;
 import com.buukle.agent.runtime.kernel.constants.RunnerConstants;
+import com.buukle.agent.runtime.kernel.constants.WaitConstants;
 import com.buukle.agent.runtime.kernel.contract.CliExecutionBinding;
 import com.buukle.agent.runtime.kernel.contract.TurnToolCall;
 import com.buukle.agent.runtime.kernel.port.SubRunExecutionContext;
@@ -42,6 +44,7 @@ public class ToolExecutor {
     private static final int CLARIFICATION_ID_LENGTH = 8;
     private static final String JSON_ERROR_UNKNOWN_TOOL = "{\"error\":\"Unknown tool: ";
     private static final String JSON_ERROR_CLARIFICATION = "{\"error\":\"Failed to process clarification\"}";
+    private static final String JSON_ERROR_WAIT = "{\"error\":\"Failed to process wait\"}";
     private static final String JSON_ERROR_UNSUPPORTED_TYPE = "{\"error\":\"Unsupported capability type: ";
     private static final String JSON_ERROR_EXECUTION = "{\"error\":\"";
 
@@ -51,6 +54,7 @@ public class ToolExecutor {
     private final SessionTodoSpi sessionTodoSpi;
     private final ApplicationEventPublisher eventPublisher;
     private final ClarificationSpi clarificationSpi;
+    private final PendingWaitSpi pendingWaitSpi;
     private final DelegateService delegateService;
     /** 任务级 MCP 凭证来源。 */
     private final TaskMcpCredentialStore taskMcpCredentialStore;
@@ -117,6 +121,24 @@ public class ToolExecutor {
                 } catch (Exception e) {
                     log.warn("Failed to process ask_clarification", e);
                     return JSON_ERROR_CLARIFICATION;
+                }
+            }
+
+            // wait：挂起-恢复，不阻塞。
+            // 这里绝对不能 sleep —— 一睡就占住 maxParallel 信号量并撞上 tool.execution-timeout，
+            // 而「等超过 60s」恰恰是常规工具语义下无法满足的需求。只写一条挂起记录就返回，
+            // SessionRunner 循环判定后 break 退出，到点由 PendingWaitWakeScheduler 唤醒。
+            if (CAPABILITY_TYPE_BUILTIN.equals(type) && WaitConstants.TOOL_NAME.equals(tc.name())) {
+                try {
+                    JsonNode argsNode = JSON.readTree(args);
+                    int waitMs = argsNode.has("ms") ? argsNode.get("ms").asInt(WaitConstants.MIN_WAIT_MS) : 0;
+                    pendingWaitSpi.createPending(sessionId, runId, tc.id(), waitMs);
+                    return JSON.writeValueAsString(Map.of(
+                            WaitConstants.JSON_STATUS, WaitConstants.STATUS_WAITING,
+                            WaitConstants.JSON_WAIT_MS, waitMs));
+                } catch (Exception e) {
+                    log.warn("Failed to process wait", e);
+                    return JSON_ERROR_WAIT;
                 }
             }
 
@@ -191,7 +213,12 @@ public class ToolExecutor {
                 return;
             }
             List<SessionTodoVO> todos = items.stream()
-                    .map(item -> new SessionTodoVO(item.getContent(), item.getStatus(), item.getPriority()))
+                    .map(item -> {
+                        SessionTodoVO vo = new SessionTodoVO(item.getContent(), item.getStatus(), item.getPriority());
+                        vo.setSkillId(item.getSkillId());
+                        vo.setStepId(item.getStepId());
+                        return vo;
+                    })
                     .toList();
             sessionTodoSpi.replaceAll(sessionId, runId, todos);
         } catch (Exception e) {

@@ -91,6 +91,41 @@
     chrome.storage.local.set({ logs: [] }).catch(() => {});
   });
 
+  // --- Copy a log line (delegated: rows are re-rendered wholesale on every log) ---
+  async function copyText(text) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch (e) {
+      // clipboardWrite 缺失或非聚焦态时回退；execCommand 需在同一用户手势的同步栈内
+      try {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.setAttribute('readonly', '');
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        const ok = document.execCommand('copy');
+        ta.remove();
+        return ok;
+      } catch (e2) {
+        return false;
+      }
+    }
+  }
+
+  document.getElementById('logContainer').addEventListener('click', async (e) => {
+    const row = e.target.closest('.log-row');
+    if (!row) return;
+    // data-line 是完整整行（含被 ellipsis 隐藏的部分）—— 截断只是视觉上的。
+    const ok = await copyText(row.dataset.line || row.textContent || '');
+    row.classList.remove('copied', 'copy-failed');
+    void row.offsetWidth; // 强制 reflow，让同一行的重复点击也能重放过渡
+    row.classList.add(ok ? 'copied' : 'copy-failed');
+    setTimeout(() => row.classList.remove('copied', 'copy-failed'), 1000);
+  });
+
   // --- Metrics: helper renderers ---
 
   function pctText(v) { return v == null ? '-' : v.toFixed(1) + '%'; }
@@ -419,7 +454,17 @@
     } else {
       container.innerHTML = logs.slice(-30).reverse().map(log => {
         const time = log.time ? new Date(log.time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '';
-        return `<div class="log-row"><span class="log-time">${time}</span><span class="log-icon">${log.success ? '✅' : '❌'}</span><span class="log-action">${log.action}</span><span class="log-detail">${log.detail || ''}</span></div>`;
+        const detail = log.detail || '';
+        // 必须转义：occluded 类错误本身就含尖括号（如 "<div#modal> intercepts the click"），
+        // 不加 esc 会被 innerHTML 当标签解析 → 前半段消失、整行 DOM 结构被打乱。
+        // 全文同时放进 title（悬停查看）与 data-line（点击复制整行）。
+        const line = `${time} ${log.success ? 'OK' : 'FAIL'} ${log.action || ''}${detail ? ' — ' + detail : ''}`;
+        return `<div class="log-row" data-line="${esc(line)}">`
+          + `<span class="log-time">${esc(time)}</span>`
+          + `<span class="log-icon">${log.success ? '✅' : '❌'}</span>`
+          + `<span class="log-action">${esc(log.action)}</span>`
+          + `<span class="log-detail" title="${esc(detail)}">${esc(detail)}</span>`
+          + `</div>`;
       }).join('');
     }
   }

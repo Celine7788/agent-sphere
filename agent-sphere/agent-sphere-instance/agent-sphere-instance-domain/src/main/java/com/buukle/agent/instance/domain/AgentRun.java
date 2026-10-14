@@ -22,6 +22,8 @@ public class AgentRun {
     private String attachments;
     /** 命中循环次数上限被强收口（任务守卫据此判失败，避免"半成品"冒充完成）。 */
     private Boolean loopCapped;
+    /** 已消耗的 agent 循环轮次；跨挂起恢复递增，使 maxLoopCount 真正成为 per-run 预算。 */
+    private Integer loopCount;
     @TableLogic
     private Boolean deleteFlag;
     private Long tenantId;

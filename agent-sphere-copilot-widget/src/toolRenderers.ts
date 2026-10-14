@@ -13,6 +13,10 @@ export interface TodoItem {
   content: string;
   status?: string;
   priority?: string;
+  /** 来源技能 id；非技能条目为 undefined/null。 */
+  skillId?: number | null;
+  /** 来源技能步骤标识，如 step1 / step1.1。 */
+  stepId?: string | null;
 }
 
 export interface ToolContent {
@@ -74,6 +78,8 @@ export function extractTodos(content: ToolContent): TodoItem[] {
           : '未命名任务',
     status: t?.status,
     priority: t?.priority,
+    skillId: t?.skillId ?? null,
+    stepId: t?.stepId ?? null,
   }));
 }
 

@@ -101,7 +101,7 @@ class SessionRunnerAttachmentTest {
         runner = new SessionRunner(properties, runSpi, sessionSpi, kernelLlmService, apiKeySpi,
                 eventPublisher, routeListBuilder, fallbackRouteExecutor, historyLoader,
                 compactionService, inputManager, runPromptBuilder, toolExecutor, titleService,
-                toolCallRecordSpi, org.mockito.Mockito.mock(com.buukle.agent.capability.skill.spi.CapabilitySkillSpi.class), redissonClient, attachmentResolver,
+                toolCallRecordSpi, redissonClient, attachmentResolver,
                 new com.buukle.agent.runtime.kernel.config.LlmRequestConfigurer(
                         org.mockito.Mockito.mock(com.buukle.agent.common.config.SystemConfigSpi.class)));
     }

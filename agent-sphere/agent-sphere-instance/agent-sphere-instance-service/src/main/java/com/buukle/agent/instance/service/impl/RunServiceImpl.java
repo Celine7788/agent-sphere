@@ -59,7 +59,10 @@ public class RunServiceImpl extends ServiceImpl<RunMapper, AgentRun> implements 
                 .in(AgentRun::getStatus, List.of(
                         RunEnum.STATUS_PENDING,
                         RunEnum.STATUS_RUNNING,
-                        RunEnum.STATUS_AWAITING_USER))
+                        RunEnum.STATUS_AWAITING_USER,
+                        // WAITING 也是停车态：loop 已退出但 run 尚未终结，必须算活动，
+                        // 否则停止/守卫会把它当成“无会话”，既不取消也漏清理。
+                        RunEnum.STATUS_WAITING))
                 .orderByDesc(AgentRun::getId)
                 .last("LIMIT 1")
                 .one();

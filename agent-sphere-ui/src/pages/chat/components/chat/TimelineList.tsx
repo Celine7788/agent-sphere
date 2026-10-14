@@ -353,6 +353,22 @@ function TodoCard({ content }: { content: any }) {
                   high
                 </Tag>
               )}
+              {(t.skillId != null || t.stepId) && (
+                <Tag
+                  color="purple"
+                  style={{ fontSize: 9, lineHeight: '15px', marginLeft: 4 }}
+                  title={
+                    t.skillId != null && t.stepId
+                      ? `技能 #${t.skillId} · 步骤 ${t.stepId}`
+                      : t.skillId != null
+                        ? `技能 #${t.skillId}`
+                        : `步骤 ${t.stepId}`
+                  }
+                >
+                  {t.skillId != null ? `skill#${t.skillId}` : ''}
+                  {t.stepId ? ` ${t.stepId}` : ''}
+                </Tag>
+              )}
             </div>
           );
         })

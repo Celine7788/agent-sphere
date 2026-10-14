@@ -472,7 +472,11 @@ export function CopilotView({ config, user }: CopilotViewProps) {
         await stopSession(apiBase, selectedSessionId);
       } catch (err) {
         setError((err as ApiError).message);
+        return;
       }
+      // 兜底：SSE 终态若丢失，runActive 会一直锁住输入/停止按钮。8s 后本地复位
+      // （权威 run_status 行到达时会自然覆盖）。与主站 UI 的兜底一致。
+      window.setTimeout(() => timeline.markRunInactive(), 8000);
     }
   };
 

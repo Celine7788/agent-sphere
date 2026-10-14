@@ -25,6 +25,7 @@ import {
   Switch,
   Tabs,
   Tag,
+  Tooltip,
 } from 'antd';
 import type dayjs from 'dayjs';
 import { useEffect, useRef, useState } from 'react';
@@ -36,6 +37,25 @@ import { formatParamDate, formatTime } from '@/utils/format';
 import { labelWithRule } from '@/utils/labelWithRule';
 import SkillMarkdownEditor from './components/SkillMarkdownEditor';
 
+/** promptTemplate 规范模板：与后端 CapabilityBuiltinToolSkillManage.SKILL_TEMPLATE 保持一致。 */
+const SKILL_TEMPLATE = `# <技能名称>
+
+## 概述
+<何时使用 / 输入·输出 / 成功标准>
+
+## step0 <准备>
+### step0.1 <子步骤>
+### step0.2 <子步骤>
+
+## step1 <主步骤>
+### step1.1 <子步骤>
+### step1.2 <子步骤>
+
+## step2 <主步骤>
+
+## 收尾对账
+<完成前必须核对的收尾条件；输出格式 / 验收标准>`;
+
 const SAMPLE_DEFINITION = `{
   "version": 1,
   "parameters": {
@@ -45,7 +65,7 @@ const SAMPLE_DEFINITION = `{
     },
     "required": ["keyword"]
   },
-  "promptTemplate": "请围绕 {{keyword}} 完成任务并返回最终结果。"
+  "promptTemplate": ${JSON.stringify(SKILL_TEMPLATE)}
 }`;
 
 const EMPTY_PARAMETERS = { type: 'object', properties: {} };
@@ -158,13 +178,20 @@ export default function SkillList() {
       title: intl.formatMessage({ id: 'pages.table.name' }),
       dataIndex: 'name',
       key: 'name',
+      width: 220,
       ellipsis: true,
     },
     {
       title: intl.formatMessage({ id: 'pages.table.description' }),
       dataIndex: 'description',
       key: 'description',
-      ellipsis: true,
+      width: 360,
+      ellipsis: { showTitle: false },
+      render: (_, record: SkillRecord) => (
+        <Tooltip placement="topLeft" title={record.description || ''}>
+          <span>{record.description || '-'}</span>
+        </Tooltip>
+      ),
     },
     {
       title: intl.formatMessage({ id: 'pages.table.status' }),
@@ -331,6 +358,7 @@ export default function SkillList() {
       title: intl.formatMessage({ id: 'pages.table.actions' }),
       key: 'actions',
       width: 160,
+      fixed: 'right',
       render: (_: any, record: any) => (
         <>
           <Button
@@ -523,13 +551,20 @@ export default function SkillList() {
       title: intl.formatMessage({ id: 'pages.table.name' }),
       dataIndex: 'name',
       key: 'name',
+      width: 220,
       ellipsis: true,
     },
     {
       title: intl.formatMessage({ id: 'pages.table.description' }),
       dataIndex: 'description',
       key: 'description',
-      ellipsis: true,
+      width: 360,
+      ellipsis: { showTitle: false },
+      render: (_, record: SkillRecord) => (
+        <Tooltip placement="topLeft" title={record.description || ''}>
+          <span>{record.description || '-'}</span>
+        </Tooltip>
+      ),
     },
     {
       title: intl.formatMessage({
@@ -556,6 +591,7 @@ export default function SkillList() {
       title: intl.formatMessage({ id: 'pages.table.actions' }),
       key: 'actions',
       width: 160,
+      fixed: 'right',
       render: (_: any, record: any) => (
         <>
           <Button
@@ -661,7 +697,7 @@ export default function SkillList() {
           rowKey="id"
           search={false}
           options={false}
-          scroll={{ y: tableScrollY }}
+          scroll={{ x: 1010, y: tableScrollY }}
           pagination={{
             defaultPageSize: 10,
             showSizeChanger: true,
@@ -706,7 +742,7 @@ export default function SkillList() {
           rowKey="id"
           search={false}
           options={false}
-          scroll={{ y: tableScrollY }}
+          scroll={{ x: 1630, y: tableScrollY }}
           pagination={{
             defaultPageSize: 10,
             showSizeChanger: true,
@@ -882,7 +918,7 @@ export default function SkillList() {
             )}
             rules={[{ required: true, message: '任务指令不能为空' }]}
           >
-            <SkillMarkdownEditor />
+            <SkillMarkdownEditor placeholder={SKILL_TEMPLATE} />
           </Form.Item>
           <Form.Item
             name="parameters"

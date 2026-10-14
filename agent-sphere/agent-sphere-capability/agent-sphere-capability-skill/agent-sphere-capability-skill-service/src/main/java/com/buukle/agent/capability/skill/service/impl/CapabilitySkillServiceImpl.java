@@ -335,13 +335,11 @@ public class CapabilitySkillServiceImpl extends ServiceImpl<SkillMapper, Capabil
 
     /** 创建/更新时校验 definition（非法给出明确错误，不再静默丢弃）。 */
     private void validateDefinition(String definition) {
-        if (definition == null || definition.isBlank()) {
-            return;
-        }
-        try {
-            com.buukle.agent.common.skill.SkillDefinitionParser.parse(definition);
-        } catch (InvalidSubRunDefinition e) {
-            throw new BizException(com.buukle.agent.common.error.CommonErrorCode.PARAM_INVALID, e.getMessage());
+        // 共用 common 的规范校验：JSON 形状 + promptTemplate 结构（# / ## stepN / ### stepN.M）。
+        // UI 表单与 agent 技能工具都经过本 service，故这里是唯一强制点。
+        String error = com.buukle.agent.common.skill.SkillTemplateValidator.validate(definition);
+        if (error != null) {
+            throw new BizException(com.buukle.agent.common.error.CommonErrorCode.PARAM_INVALID, error);
         }
     }
 }

@@ -41,7 +41,7 @@ Files:
 - **Screenshots (vision operation)**: `screenshot` action (viewport via `Page.captureScreenshot`, `scope=full` uses `captureBeyondViewport`) lives **only** in `lib/cdp-client.js#captureScreenshot` — the one place allowed to call `chrome.debugger`. The base64 is POSTed to `POST /api/v1/browser/screenshot` (Bearer) and the callback carries only the `fileKey` + dimensions (no large base64 over the callback/Redis). `clickAt(x, y)` clicks at the device pixels of the **last viewport screenshot** (converted to CSS px via `devicePixelRatio`); non-interactive points click through with a `warning`. Snapshot items carry `bounds` (top-frame CSS px rect) for screenshot↔ref alignment. Full-page screenshots are observation-only — no coordinate clicking.
 - **executeJS is two-tier, debugger is the strict-CSP fallback** (in `background.js#executeJsOnTab`):
   1. MAIN world via `chrome.scripting` (`world:'MAIN'`) — the page CSP applies, so this works on most sites and fails fast on strict-CSP origins (cached in `cspBlockedOrigins`).
-  2. `chrome.debugger` `Runtime.evaluate` (bypasses CSP; strict sites like 猎聘 land here).
+  2. `chrome.debugger` `Runtime.evaluate` (bypasses CSP; strict sites  land here).
   **There is NO isolated-world tier**: MV3's extension CSP (`script-src 'self' 'wasm-unsafe-eval' …`) forbids `eval()`/`new Function()` in content-script isolated worlds, so an isolated eval can never work — do not reintroduce it.
   Keep that order. Do not make debugger the default path.
 - **executeJS result transparency**: results always carry `method` (`scripting-main`/`debugger`), `resultType`, and — when execution may have been blocked or the value was unserializable — a `warning` field. The backend surfaces these (`ChromeResultVO.warning/resultType`) so the agent stops retrying a blocked executeJS.
@@ -110,6 +110,32 @@ no callback field, no wire-protocol change. Off by default (`settings.browserMet
   `audit_verdict` on a record is the only ground truth, set by hand from the popup.
 - The popup duplicates `buildSnapshot()`'s arithmetic locally (`snapshotOf` in popup.js)
   because it cannot import an ESM module. **Change one, change both.**
+
+## popup rendering: escape before `innerHTML`
+
+`popup.js` builds most panels by string-concatenating into `innerHTML`, so **every
+tool/user-derived string must go through `esc()`**. Tool errors are not inert text —
+`occluded` messages literally contain markup (`"<div#modal> intercepts the click"`), so an
+unescaped `${log.detail}` makes the browser parse `<div#modal>` as a tag: the leading
+token vanishes (looks like the message is "incomplete") and the stray element swallows the
+rest of the row's spans. The Logs list was the one sink that missed `esc()` while Metrics
+already had it — keep it that way for any new sink.
+
+Because rows are re-rendered wholesale, per-row listeners are a leak/footgun: attach ONE
+delegated listener on the container (see `mList` and `logContainer`). Inline `onclick=` is
+also illegal under MV3's CSP. Log rows keep a clipped single line via CSS `text-overflow:
+ellipsis` — that is **visual only**, so the full text is recovered from `data-line`
+(click-to-copy) and the `title` attribute (hover); no extra state is needed.
+
+## no third-party brands
+
+Never put the brand or domain of a **specific third-party site we automate** into code,
+comments, log text, tests or docs (see the root `AGENTS.md` rule). This is why
+`RISK_URL_PATTERNS` matches a generic `//safe.` host prefix plus `captcha` / `intercept`
+path fragments instead of a brand domain, and why test fixtures use `host.example` /
+`example`. If a brand-looking value is genuinely needed, move it to config (popup setting /
+`agent_system_config` / yml) and keep only the key + default in code. Do **not** edit applied
+Flyway migrations to scrub seeds — add a new migration.
 
 ## Git
 

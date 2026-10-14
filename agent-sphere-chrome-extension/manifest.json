@@ -4,7 +4,7 @@
   "version": "1.2.0",
   "description": "Bridges AgentSphere AI with your browser for automated operations",
   "homepage_url": "https://github.com/nullpointexception-i/agent-sphere",
-  "permissions": ["tabs", "scripting", "storage", "activeTab", "alarms", "debugger", "webNavigation", "tabGroups", "offscreen"],
+  "permissions": ["tabs", "scripting", "storage", "activeTab", "alarms", "debugger", "webNavigation", "tabGroups", "offscreen", "clipboardWrite"],
   "host_permissions": [
     "<all_urls>"
   ],

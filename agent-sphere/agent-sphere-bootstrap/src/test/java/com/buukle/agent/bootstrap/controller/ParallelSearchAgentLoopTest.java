@@ -218,7 +218,7 @@ class ParallelSearchAgentLoopTest {
             assertSame(route, ctx.getModelRoute(), "Keep the selected model route");
             assertNull(route.getApiKeyId());
             ToolExecutor executor = new ToolExecutor(List.of(mcp), builtin, mock(CliExecutorService.class),
-                    mock(SessionTodoSpi.class), mock(ApplicationEventPublisher.class), mock(ClarificationSpi.class),
+                    mock(SessionTodoSpi.class), mock(ApplicationEventPublisher.class), mock(ClarificationSpi.class), mock(PendingWaitSpi.class),
                     mock(DelegateService.class), new TaskMcpCredentialStore(redis));
             if (!enabled) {
                 assertTrue(ctx.getTools().stream().noneMatch(t -> CAPABILITY_TYPE_MCP.equals(t.getCapabilityType())));
@@ -307,7 +307,7 @@ class ParallelSearchAgentLoopTest {
                     new RouteListBuilder(mock(RouteSpi.class), mock(InstanceSpi.class), model),
                     new FallbackRouteExecutor(), mock(HistoryLoader.class), mock(CompactionService.class), input,
                     new RunPromptBuilder(), executor, mock(TitleService.class), mock(AgentToolCallRecordSpi.class),
-                    mock(com.buukle.agent.capability.skill.spi.CapabilitySkillSpi.class), redis, mock(ChatAttachmentResolver.class), new LlmRequestConfigurer(mock(SystemConfigSpi.class)));
+                    redis, mock(ChatAttachmentResolver.class), new LlmRequestConfigurer(mock(SystemConfigSpi.class)));
             runner.run(SESSION_ID);
             if (modelFailure.get() != null) throw new AssertionError("Controlled model validation failed", modelFailure.get());
             assertEquals("COMPLETED", run.getStatus(), "Runner must finish all result-dependent turns");

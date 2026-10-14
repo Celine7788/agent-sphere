@@ -57,7 +57,7 @@ class SessionCleanupTaskTest {
     private static final int BATCH_SIZE = 2;
     private static final int MAX_BATCHES = 5;
     private static final List<String> ACTIVE_RUN_STATUSES =
-            List.of(RunEnum.STATUS_PENDING, RunEnum.STATUS_RUNNING);
+            List.of(RunEnum.STATUS_PENDING, RunEnum.STATUS_RUNNING, RunEnum.STATUS_WAITING);
     private static final List<String> ACTIVE_TASK_STATUSES =
             List.of(TaskEnum.STATUS_QUEUED, TaskEnum.STATUS_RUNNING);
 
@@ -231,7 +231,7 @@ class SessionCleanupTaskTest {
     }
 
     @Test
-    @DisplayName("活跃守卫：状态集合必须是 PENDING/RUNNING 与 QUEUED/RUNNING")
+    @DisplayName("活跃守卫：状态集合必须是 PENDING/RUNNING/WAITING 与 QUEUED/RUNNING")
     void passesActiveStatusesFromEnums() {
         stubHappyPath();
         stubExpiredSessions(List.of(), List.of());

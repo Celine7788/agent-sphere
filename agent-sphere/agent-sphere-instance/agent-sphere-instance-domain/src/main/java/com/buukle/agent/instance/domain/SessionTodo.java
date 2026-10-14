@@ -16,6 +16,10 @@ public class SessionTodo {
     private String status;
     private String priority;
     private Integer sortOrder;
+    /** 来源技能 id；模型采用技能建立该条目时填写。 */
+    private Long skillId;
+    /** 来源技能步骤标识（如 step1 / step1.1），与 skillId 配套用于回查技能正文。 */
+    private String stepId;
     @TableLogic
     private Boolean deleteFlag;
     private Long tenantId;

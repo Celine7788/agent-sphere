@@ -22,6 +22,14 @@ public class RunVO implements Serializable {
     private String status;
     /** 命中循环次数上限被强收口（任务守卫据此判失败） */
     private Boolean loopCapped;
+    /**
+     * 该 run 已消耗的 agent 循环轮次（V82 起持久化）。
+     *
+     * <p>此前 loopCount 是 SessionRunner#runInternal 的局部变量，每次挂起恢复
+     * （澄清 AWAITING_USER / 等待 WAITING）都归零，maxLoopCount 因而只约束「单次调用」，
+     * 模型可反复挂起无限续命。落库后恢复时读回，循环预算才真正是 per-run。
+     */
+    private Integer loopCount;
     private String delivery;
     private String createdBy;
     private String createdAt;

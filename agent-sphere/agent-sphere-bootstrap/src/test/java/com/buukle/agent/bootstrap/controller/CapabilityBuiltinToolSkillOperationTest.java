@@ -32,7 +32,7 @@ import static org.mockito.Mockito.when;
 class CapabilityBuiltinToolSkillOperationTest {
 
     private static final String VALID_DEFINITION = """
-            {"version":1,"parameters":{"type":"object","properties":{}},"promptTemplate":"## 任务\\n按 JD 分析候选人"}""";
+            {"version":1,"parameters":{"type":"object","properties":{}},"promptTemplate":"# 面试助手\\n\\n## step1 任务\\n### step1.1 分析\\n按 JD 分析候选人\\n\\n## step2 输出\\n返回 JSON"}""";
 
     private CapabilitySkillSpi skillSpi;
     private InstanceCapabilitySpi instanceCapabilitySpi;
@@ -45,7 +45,7 @@ class CapabilityBuiltinToolSkillOperationTest {
         skillSpi = mock(CapabilitySkillSpi.class);
         instanceCapabilitySpi = mock(InstanceCapabilitySpi.class);
         sessionSpi = mock(SessionSpi.class);
-        libraryTool = new CapabilityBuiltinToolSkillLibrary(skillSpi, instanceCapabilitySpi, sessionSpi, mock(com.buukle.agent.instance.spi.SessionTodoSpi.class));
+        libraryTool = new CapabilityBuiltinToolSkillLibrary(skillSpi, instanceCapabilitySpi, sessionSpi);
         manageTool = new CapabilityBuiltinToolSkillManage(skillSpi, instanceCapabilitySpi, sessionSpi);
     }
 
@@ -88,6 +88,26 @@ class CapabilityBuiltinToolSkillOperationTest {
         SkillWriteResultVO r = (SkillWriteResultVO) manageTool.execute(ctx);
 
         assertTrue(r.getPreview().contains("Invalid definition"));
+        verify(skillSpi, never()).createSkill(any(CreateSkillDTO.class), any());
+        verify(instanceCapabilitySpi, never()).createCapability(any(CreateInstanceCapabilityDTO.class));
+    }
+
+    @Test
+    void create_nonConformantStructure_rejectedWithTemplate() {
+        // 结构不合规：没有 H1、没有 ## stepN 步骤 —— 必须在落库前被拦下并回带模板
+        String bad = """
+                {"version":1,"parameters":{"type":"object","properties":{}},"promptTemplate":"## 任务\\nold body"}""";
+
+        SkillWriteExecuteContext ctx = new SkillWriteExecuteContext();
+        ctx.setSessionId(1L);
+        ctx.setAction("create");
+        ctx.setName("bad");
+        ctx.setDefinition(bad);
+
+        SkillWriteResultVO r = (SkillWriteResultVO) manageTool.execute(ctx);
+
+        assertTrue(r.getPreview().contains("结构不符合技能规范"), r.getPreview());
+        assertTrue(r.getPreview().contains("# <技能名称>"), "应回带标准模板: " + r.getPreview());
         verify(skillSpi, never()).createSkill(any(CreateSkillDTO.class), any());
         verify(instanceCapabilitySpi, never()).createCapability(any(CreateInstanceCapabilityDTO.class));
     }
@@ -202,7 +222,7 @@ class CapabilityBuiltinToolSkillOperationTest {
         String definition = """
                 {"version":1,
                  "parameters":{"type":"object","properties":{"keyword":{"type":"string"}}},
-                 "promptTemplate":"## 任务\\nold body\\n\\n## 输出\\nout"}""";
+                 "promptTemplate":"# 面试助手\\n\\n## step1 任务\\nold body\\n\\n## step2 输出\\nout"}""";
         when(sessionSpi.getSession(1L)).thenReturn(sessionOf(1L, "alice"));
         when(instanceCapabilitySpi.getCapabilitiesByInstance(1L)).thenReturn(List.of(cap("skill", 100L)));
         when(skillSpi.getSkill(100L)).thenReturn(skill(100L, "a", null, definition));
@@ -403,7 +423,7 @@ class CapabilityBuiltinToolSkillOperationTest {
         String definition = """
                 {"version":1,
                  "parameters":{"type":"object","properties":{"keyword":{"type":"string"}}},
-                 "promptTemplate":"## 任务\\nold body"}""";
+                 "promptTemplate":"# 面试助手\\n## step1 任务\\nold body"}""";
         when(sessionSpi.getSession(1L)).thenReturn(sessionOf(1L, "alice"));
         when(instanceCapabilitySpi.getCapabilitiesByInstance(1L)).thenReturn(List.of(cap("skill", 100L)));
         when(skillSpi.getSkill(100L)).thenReturn(skill(100L, "a", null, definition));

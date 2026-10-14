@@ -6,6 +6,7 @@ import com.buukle.agent.capability.mcp.service.mcp.McpProtocolConstants;
 import com.buukle.agent.capability.mcp.spi.CapabilityMcpSpi;
 import com.buukle.agent.common.mcp.TaskMcpCredentialStore;
 import com.buukle.agent.instance.spi.ClarificationSpi;
+import com.buukle.agent.instance.spi.PendingWaitSpi;
 import com.buukle.agent.instance.spi.SessionTodoSpi;
 import com.buukle.agent.runtime.kernel.constants.ExecBindingKeys;
 import com.buukle.agent.runtime.kernel.contract.TurnToolCall;
@@ -59,6 +60,8 @@ class ToolExecutorMcpCredentialTest {
     @Mock
     ClarificationSpi clarificationSpi;
     @Mock
+    PendingWaitSpi pendingWaitSpi;
+    @Mock
     DelegateService delegateService;
     @Mock
     TaskMcpCredentialStore credentialStore;
@@ -68,7 +71,7 @@ class ToolExecutorMcpCredentialTest {
     @BeforeEach
     void setUp() {
         toolExecutor = new ToolExecutor(mcpSpis, builtinSpi, cliExecutorService, sessionTodoSpi,
-                eventPublisher, clarificationSpi, delegateService, credentialStore);
+                eventPublisher, clarificationSpi, pendingWaitSpi, delegateService, credentialStore);
         org.mockito.Mockito.lenient().when(mcpSpis.get(0)).thenReturn(mcpSpi);
     }
 

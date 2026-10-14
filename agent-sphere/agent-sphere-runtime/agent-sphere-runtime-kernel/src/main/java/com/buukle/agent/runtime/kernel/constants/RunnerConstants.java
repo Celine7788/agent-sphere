@@ -19,27 +19,34 @@ public final class RunnerConstants {
             "\n\n**请根据任务状态变更及时更新此列表，不要等待用户提醒。"
             + "注意：此列表只是进度记录，**不构成任务完成判据** —— 任务是否完成由任务指令"
             + "（技能步骤 / 期望输出 / 收尾条件）决定，而不是由本列表全部 completed 决定。"
-            + "若本列表由技能步骤自动生成，不要重建，只更新状态。**";
-    /**
-     * 技能槽尾部段：本任务已读取的技能名/版本 + 大纲（H2/H3 + 行号）。
-     *
-     * <p>为什么需要它：大技能正文在**跨 run 重放**时会被 {@code ToolResultCompressor}
-     * 按 2000 字符上限压成"头 100 + 尾 50"，模型会丢掉规则开始即兴。把**大纲**放进一个
-     * 受保护的尾部 system 槽（每轮原位刷新、不参与压缩），模型就永远看得到"地图"，
-     * 正文按需 {@code get(sectionHeading=…)} 读取 —— 每次都是小片段，不会被压掉。
-     *
-     * <p>header 同时作为槽位定位 marker（与待办槽同一套机制）。
-     */
-    public static final String PROMPT_SKILL_SLOT_HEADER = "\n\n## 本任务技能（按需按节读取）\n";
+            + "它由你维护：采用技能建立时按技能步骤填写，否则由你自行规划；"
+            + "任何更新都必须回传完整清单（该工具是整体替换）。**";
     public static final String PROMPT_TOOLS_FOOTER = """
             
-            TASK LIST: If this task is driven by a skill (see the skill slot / skill_library),
-            the skill's steps ARE the plan — read the skill and follow its steps, and do NOT
-            build a second task list (it may already be seeded for you; if so, only update
-            statuses). Otherwise, call the task list tool to create a structured task list
-            covering the user's request before acting. Either way, keep the list in sync with
-            actual progress by calling the task list tool whenever a task's status changes
-            (pending → in_progress → completed / cancelled).
+            TASK LIST: keep exactly ONE task list via the task list tool. It is the plan for the
+            WHOLE task and must always contain EVERYTHING still to do — regardless of which skill
+            you have read.
+
+            - If NO skill applies: create your own task list covering the user's request before
+              acting, and restructure it freely (add / remove / reorder / re-scope) as work evolves.
+            - If a skill IS the whole plan: read it (skill_library) first, then lay the list out
+              from its steps — every `## stepN` and `### stepN.M`, in order — writing each item's
+              content as plain numbering derived from the step id (`N. <title>` for stepN,
+              `N.M <title>` for stepN.M; drop the word "step"; no `#` marks). For each such item
+              also set its `skillId` (the skill id returned by skill_library) and `stepId`
+              (the step id, e.g. step1 / step1.1).
+            - If a skill only details ONE OR A FEW steps of your EXISTING plan: KEEP the existing
+              list and use that skill as the method for those steps — only add `skillId`/`stepId`
+              to the relevant items (optionally nest the skill's sub-steps under them). Do NOT
+              replace the plan with the skill's steps and do NOT drop unrelated items.
+
+            Before executing any item that carries `skillId` + `stepId`, read that step's body with
+            skill_library(action=get, skillId=<skillId>, sectionHeading=<stepId>) — the outline is
+            only titles; the method lives in the section (an H2 section returns its H3 children too).
+
+            The task list tool REPLACES the entire list — always pass the COMPLETE list (existing
+            items plus any additions/changes); anything you omit is deleted. Keep it in sync with
+            actual progress whenever a task's status changes (pending → in_progress → completed / cancelled).
 
             A todo's status is PROGRESS ONLY. Marking every todo 'completed' does NOT mean the
             task is finished — completion is decided by the task instructions and, when a skill

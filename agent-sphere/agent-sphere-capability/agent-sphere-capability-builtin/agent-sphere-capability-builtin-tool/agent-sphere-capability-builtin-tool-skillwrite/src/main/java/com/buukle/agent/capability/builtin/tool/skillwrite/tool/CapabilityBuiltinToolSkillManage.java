@@ -14,8 +14,7 @@ import com.buukle.agent.capability.builtin.tool.spi.util.ToolSchemaUtil;
 import com.buukle.agent.capability.skill.dtvo.dto.CreateSkillDTO;
 import com.buukle.agent.capability.skill.dtvo.vo.SkillVO;
 import com.buukle.agent.capability.skill.spi.CapabilitySkillSpi;
-import com.buukle.agent.common.skill.SkillDefinitionParser;
-import com.buukle.agent.common.sub.agent.InvalidSubRunDefinition;
+import com.buukle.agent.common.skill.SkillTemplateValidator;
 import com.buukle.agent.instance.dtvo.dto.CreateInstanceCapabilityDTO;
 import com.buukle.agent.instance.dtvo.vo.CapabilityVO;
 import com.buukle.agent.instance.dtvo.vo.SessionVO;
@@ -50,8 +49,17 @@ public class CapabilityBuiltinToolSkillManage implements CapabilityBuiltinToolSp
     static final String MARKDOWN_FENCE = "```json";
 
     private static final String TOOL_DESCRIPTION = """
-            创建/追加/更新绑定到当前实例的技能定义（definition 为含 parameters + promptTemplate 的 JSON）。
-            """;
+            创建/追加/更新绑定到当前实例的技能。
+
+            definition 为 JSON：{"version":1,"parameters":{JSON Schema},"promptTemplate":"<Markdown>"}。
+            promptTemplate 必须遵循固定的标题结构；保存前会**前置校验**（UI 表单与 agent 工具共用同一校验），不合规直接报错并回带模板：
+            - `# <技能名>`：有且仅有一个 H1；
+            - `## stepN <步骤名>`：步骤，至少一个（N 为数字，如 step1）；
+            - `### stepN.M <子步骤名>`：子步骤，必须挂在其上方最近的、同编号的 `## stepN` 之下；
+            - 非步骤的 H2（如 概述 / 收尾对账）不要带 `stepN` 前缀。
+
+            标准模板：
+            """ + SkillTemplateValidator.SKILL_TEMPLATE;
 
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
 
@@ -198,6 +206,11 @@ public class CapabilityBuiltinToolSkillManage implements CapabilityBuiltinToolSp
         ObjectNode rebuilt = root.deepCopy();
         String appended = prompt.endsWith("\n") ? prompt + ctx.getContent().trim() : prompt + "\n\n" + ctx.getContent().trim();
         rebuilt.put("promptTemplate", appended);
+        // 追加后同样要合规：否则 append 会成为绕过结构校验的后门。
+        String appendValidation = validateDefinition(rebuilt.toString());
+        if (appendValidation != null) {
+            return error(ACTION_APPEND, appendValidation);
+        }
         CreateSkillDTO dto = new CreateSkillDTO();
         dto.setName(existing.getName());
         dto.setDescription(existing.getDescription());
@@ -346,13 +359,9 @@ public class CapabilityBuiltinToolSkillManage implements CapabilityBuiltinToolSp
         return false;
     }
 
+    /** 校验 definition：JSON 形状 + promptTemplate 结构；委托 common 的共用校验（UI 表单/工具口径一致）。 */
     private String validateDefinition(String definition) {
-        try {
-            SkillDefinitionParser.parse(definition);
-            return null;
-        } catch (InvalidSubRunDefinition e) {
-            return "Invalid definition: " + e.getMessage();
-        }
+        return SkillTemplateValidator.validate(definition);
     }
 
     private JsonNode readDefinitionJson(String definition) throws Exception {

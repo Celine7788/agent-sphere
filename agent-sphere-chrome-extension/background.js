@@ -35,26 +35,12 @@ let commandInFlightAt = 0;
 // 让后端 LLM 决定等待还是先 getContent 复核，而不是连续空发。
 let commandActive = null;
 
-// ---- 节流地板（技术侧安全网）----
-// 业务节奏由 skill 定义（更大值）；扩展只保证"下限"，避免完全无节流。
-// 读动作互相 ≥1.5s，写动作 ≥3s，收藏类 ≥10s（按 text/selector 是否含"收藏"启发式判定）。
-const THROTTLE_READ_MS = 1500;
-const THROTTLE_WRITE_MS = 3000;
-const THROTTLE_FAVORITE_MS = 10000;
-let lastCommandAt = 0;
-
-function throttleFloorMs(action, params) {
-  const isWrite = WRITE_ACTIONS.has(action) || action === 'clickAt' || action === 'navigate';
-  if (!isWrite) return THROTTLE_READ_MS;
-  const hint = `${(params && params.text) || ''} ${(params && params.selector) || ''}`;
-  if (hint.includes('收藏') || /favorite/i.test(hint)) return THROTTLE_FAVORITE_MS;
-  return THROTTLE_WRITE_MS;
-}
-
 // ---- 风控命中（无人值守：命中即停）----
-// 判定：受控 tab 被重定向到猎聘安全中心/验证码页。命中后**按 session 锁定**，
+// 判定：受控 tab 被重定向到安全中心/验证码页。命中后**按 session 锁定**，
 // 后续命令一律拒绝 —— 与产品口径「命中就停止，不做等待/重试/绕行」一致。
-const RISK_URL_PATTERNS = [/safe\.liepin\.com/i, /captchaPage/i, /\/v\/intercept\//i];
+// 域名特征刻意泛化，不写具体站点品牌：`//safe.` 主机前缀 + captcha/intercept 路径片段
+// 已覆盖真实风控跳转。若某站点的风控域不是这个形态，应改为从配置读取而非硬编码品牌。
+const RISK_URL_PATTERNS = [/\/\/safe\./i, /captchaPage/i, /\/v\/intercept\//i];
 const RISK_TITLE_PATTERNS = [/验证码/, /安全中心/];
 const riskLockedSessions = new Set();
 
@@ -68,8 +54,6 @@ async function detectRiskChallenge(tabId) {
     || RISK_TITLE_PATTERNS.some((re) => re.test(title));
   return hit ? { url, title } : null;
 }
-
-const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // --- Keep the offscreen document (SSE host) alive / recreate if the browser closed it ---
 function startOffscreenKeepalive() {
@@ -335,15 +319,8 @@ async function executeInPage(commandId, action, params, sessionId) {
   commandActive = { action, at: commandInFlightAt };
   const t0 = Date.now();
   try {
-    // 节流地板：与上一命令结束之间至少间隔 floor ms（业务节奏由 skill 定更大值）
-    const floor = throttleFloorMs(action, params);
-    if (lastCommandAt > 0) {
-      const gap = Date.now() - lastCommandAt;
-      if (gap < floor) await sleepMs(floor - gap);
-    }
     await executeInPageInner(commandId, action, params, sessionId);
   } finally {
-    lastCommandAt = Date.now();
     commandInFlightAt = 0;
     commandActive = null;
     console.log(`[ChromeCmd] action=${action} tab=${params.tabId || tabManager.getControlled() || '-'} ms=${Date.now() - t0}`);
@@ -838,6 +815,12 @@ async function executeInPageInner(commandId, action, params, sessionId) {
       return;
     }
 
+    // 非 navigate：先把受控 tab 切到前台，再分发。后台 tab 会被 Chrome 节流
+    // （rAF 暂停、setTimeout 钳到 ≥1s，隐藏满 5 分钟到 ~1 次/分钟），而 clickAt /
+    // executeJS / screenshot / getContent 及写动作的稳定性等待全都依赖渲染帧 ——
+    // 后台下每条动作成倍变慢并撞上后端动作超时。放在所有分支之前才能全覆盖。
+    await tabManager.ensureForeground(params.tabId || tabManager.getControlled());
+
     if (action === 'executeJS') {
       const targetTabId = params.tabId || tabManager.getControlled() || (await getActiveTabId());
       if (!targetTabId) {
@@ -1046,6 +1029,7 @@ async function handleNavigate(commandId, params, sessionId) {
       targetOrigin = originOf(finalUrl) || targetOrigin;
       await saveSessionState({ targetOrigin });
       tabManager.setControlled(tab.id);
+      await tabManager.ensureForeground(tab.id);
       tabManager.groupTab(tab.id);
       recordNavigate(commandId, sessionId, navT0, { url: finalUrl, redirected: finalUrl !== params.url, ok: true });
       sendCallbackSafe(commandId, okResult({ tabId: tab.id, url: finalUrl, redirected: finalUrl !== params.url }, 'navigate'), tab.id, sessionId);
@@ -1068,6 +1052,7 @@ async function handleNavigate(commandId, params, sessionId) {
         targetOrigin = originOf(existingUrl) || targetOrigin;
         await saveSessionState({ targetOrigin });
         tabManager.setControlled(reusable.id);
+        await tabManager.ensureForeground(reusable.id);
         await tabManager.groupTab(reusable.id);
         recordNavigate(commandId, sessionId, navT0, { url: existingUrl, redirected: existingUrl !== params.url, reused: true, ok: true });
         sendCallbackSafe(commandId, okResult({ tabId: reusable.id, url: existingUrl, redirected: existingUrl !== params.url, reused: true }, 'navigate'), reusable.id, sessionId);
@@ -1091,6 +1076,7 @@ async function handleNavigate(commandId, params, sessionId) {
         targetOrigin = originOf(existingUrl) || targetOrigin;
         await saveSessionState({ targetOrigin });
         tabManager.setControlled(existingTab.id);
+        await tabManager.ensureForeground(existingTab.id);
         await tabManager.groupTab(existingTab.id);
         recordNavigate(commandId, sessionId, navT0, { url: existingUrl, redirected: existingUrl !== params.url, reused: true, ok: true });
         sendCallbackSafe(commandId, okResult({ tabId: existingTab.id, url: existingUrl, redirected: existingUrl !== params.url, reused: true }, 'navigate'), existingTab.id, sessionId);
@@ -1102,7 +1088,9 @@ async function handleNavigate(commandId, params, sessionId) {
     }
   }
 
-  const tab = await chrome.tabs.create({ url: params.url, active: false });
+  // active:true —— 受控 tab 必须在前台。后台 tab 会被 Chrome 节流（rAF 暂停、
+  // 定时器钳到 ≥1s），而插件的稳定性等待全部依赖它们，会导致动作成倍变慢并超时。
+  const tab = await chrome.tabs.create({ url: params.url, active: true });
   await tabManager.waitForTabComplete(tab.id, 10000);
   await waitIdle(tab.id);
   if (!await tabManager.ensureContentScript(tab.id)) {
@@ -1114,6 +1102,7 @@ async function handleNavigate(commandId, params, sessionId) {
   targetOrigin = originOf(finalUrl) || targetOrigin;
   await saveSessionState({ targetOrigin });
   tabManager.setControlled(tab.id);
+  await tabManager.ensureForeground(tab.id);
   tabManager.groupTab(tab.id);
   recordNavigate(commandId, sessionId, navT0, { url: finalUrl, redirected: finalUrl !== params.url, ok: true });
   sendCallbackSafe(commandId, okResult({ tabId: tab.id, url: finalUrl, redirected: finalUrl !== params.url }, 'navigate'), tab.id, sessionId);

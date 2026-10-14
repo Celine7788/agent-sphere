@@ -4,6 +4,7 @@ import com.buukle.agent.capability.builtin.dtvo.enums.BuiltinToolEnum;
 import com.buukle.agent.capability.builtin.dtvo.vo.BuiltinToolVO;
 import com.buukle.agent.capability.builtin.spi.CapabilityBuiltinSpi;
 import com.buukle.agent.runtime.kernel.constants.ChatClarification;
+import com.buukle.agent.runtime.kernel.constants.WaitConstants;
 import com.buukle.agent.capability.cli.dtvo.vo.CliVO;
 import com.buukle.agent.capability.cli.spi.CapabilityCliSpi;
 import com.buukle.agent.capability.mcp.dtvo.vo.McpToolInfoVO;
@@ -42,6 +43,7 @@ public class ContextPreparer {
     private static final String DEFAULT_EMPTY_SCHEMA = "{\"type\":\"object\",\"properties\":{}}";
     private static final String CLARIFICATION_PARAM_SCHEMA = "{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"string\",\"description\":\"Question or prompt for the user (clear, friendly, as if speaking to them)\"},\"type\":{\"type\":\"string\",\"enum\":[\"confirm\",\"choice\",\"input\"],\"description\":\"confirm=yes/no; choice=provide 2-5 concise distinct options; input=free-form answer\"},\"options\":{\"type\":\"array\",\"minItems\":1,\"maxItems\":5,\"items\":{\"type\":\"object\",\"properties\":{\"label\":{\"type\":\"string\",\"description\":\"Short display text shown to the user (max ~20 chars, a concise option phrase, NOT a full sentence, NOT placeholder like 'http://')\"},\"value\":{\"type\":\"string\",\"description\":\"Machine value sent back to the agent when the user picks this option\"},\"description\":{\"type\":\"string\",\"description\":\"Optional short explanation for the option\"}},\"required\":[\"label\"],\"additionalProperties\":false},\"description\":\"2-5 concise, distinct choices (required when type=choice). No duplicates, no placeholder URLs, no full sentences.\"},\"description\":{\"type\":\"string\",\"description\":\"Additional context or explanation to help the user understand the question\"}},\"required\":[\"title\",\"type\"]}";
 
+    private static final String WAIT_PARAM_SCHEMA = "{\"type\":\"object\",\"properties\":{\"ms\":{\"type\":\"integer\",\"minimum\":100,\"maximum\":600000,\"description\":\"Milliseconds to wait (100-600000). The run suspends immediately and resumes automatically afterwards. Use it to give dynamic content time to appear or settle.\"}},\"required\":[\"ms\"],\"additionalProperties\":false}";
     private final InstanceCapabilitySpi capabilitySpi;
     private final CapabilityMcpSpi mcpSpi;
     private final CapabilitySkillSpi skillSpi;
@@ -188,6 +190,24 @@ public class ContextPreparer {
                     .description(ChatClarification.DESCRIPTION)
                     .parametersSchemaJson(CLARIFICATION_PARAM_SCHEMA)
                     .execBinding(clarificationBinding).build());
+        }
+        // 默认注册 wait：挂起-恢复型工具，全局可用（不需要用户在场，故无 noClarification 豁免）。
+        // 形态照 ask_clarification：无 SPI bean、无 DB seed，直接注册。
+        {
+            long waitId = BuiltinToolEnum.WAIT.getId();
+            Map<String, Object> waitBinding = new HashMap<>();
+            waitBinding.put(ExecBindingKeys.BUILTIN_INTERNAL_NAME, WaitConstants.INTERNAL_NAME);
+            result.add(RuntimeTool.builder()
+                    .capabilityType(CAPABILITY_TYPE_BUILTIN)
+                    .capabilityId(waitId)
+                    .llmToolName(LLM_PREFIX_BUILTIN + waitId)
+                    .toolRef(ToolRefs.builtin(WaitConstants.INTERNAL_NAME))
+                    .displayName(WaitConstants.DISPLAY_NAME)
+                    .displayNameCn(WaitConstants.DISPLAY_NAME_CN)
+                    .displayNameEn(WaitConstants.DISPLAY_NAME)
+                    .description(WaitConstants.DESCRIPTION)
+                    .parametersSchemaJson(WAIT_PARAM_SCHEMA)
+                    .execBinding(waitBinding).build());
         }
         Set<String> seen = new HashSet<>();
         List<RuntimeTool> deduped = new ArrayList<>();

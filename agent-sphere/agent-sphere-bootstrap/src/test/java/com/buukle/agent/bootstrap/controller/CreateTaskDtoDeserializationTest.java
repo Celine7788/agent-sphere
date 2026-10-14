@@ -16,16 +16,16 @@ class CreateTaskDtoDeserializationTest {
 
     @Test
     void configAsString_shouldDeserializeToMap() throws Exception {
-        String body = "{\"goal\":\"寻访\",\"businessType\":\"sourcing\",\"config\":\"{\\\"channels\\\":[\\\"liepin\\\"]}\"}";
+        String body = "{\"goal\":\"寻访\",\"businessType\":\"sourcing\",\"config\":\"{\\\"channels\\\":[\\\"example\\\"]}\"}";
         CreateTaskDTO dto = MAPPER.readValue(body, CreateTaskDTO.class);
-        assertEquals(Map.of("channels", List.of("liepin")), dto.getConfig());
+        assertEquals(Map.of("channels", List.of("example")), dto.getConfig());
     }
 
     @Test
     void configAsObject_shouldDeserializeToMap() throws Exception {
-        String body = "{\"goal\":\"寻访\",\"businessType\":\"sourcing\",\"config\":{\"channels\":[\"liepin\"]}}";
+        String body = "{\"goal\":\"寻访\",\"businessType\":\"sourcing\",\"config\":{\"channels\":[\"example\"]}}";
         CreateTaskDTO dto = MAPPER.readValue(body, CreateTaskDTO.class);
-        assertEquals(Map.of("channels", List.of("liepin")), dto.getConfig());
+        assertEquals(Map.of("channels", List.of("example")), dto.getConfig());
     }
 
     @Test

@@ -53,10 +53,10 @@ public class ChromeExecuteContext extends ExecuteContext {
     @Schema(example = "3000", description = "元素出现/可交互前的最大等待毫秒（默认3000），click/type/hover/select/upload生效")
     private Integer waitMs;
 
-    @Schema(example = "500", description = "wait动作：固定等待毫秒")
+    @Schema(example = "500", description = "【已废弃】原 wait 动作的固定等待毫秒。wait 已下沉为全局内置工具，Chrome 不再有 wait 动作；字段仅为线协议兼容保留。")
     private Integer ms;
 
-    @Schema(example = "8000", description = "wait动作：等待selector/text/ref出现的最长毫秒（默认8000）")
+    @Schema(example = "10", description = "单条命令的执行超时覆盖（秒，min 2 / max 30）。用于慢渲染页面；等待动态内容请用 getContent(mode:ready, waitMs) 或全局 wait 工具。")
     private Integer timeout;
 
     @Schema(example = "Enter", description = "key动作：按键名（Enter/Tab/Escape/Backspace/ArrowDown等），可选codeKey指定物理键")

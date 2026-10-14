@@ -109,6 +109,21 @@ export function TodoCard({ content }: { content: ToolContent }) {
             {t.priority === 'high' && (
               <span className="aw-tool-todo-pri">高</span>
             )}
+            {(t.skillId != null || t.stepId) && (
+              <span
+                className="aw-tool-todo-skill"
+                title={
+                  t.skillId != null && t.stepId
+                    ? `技能 #${t.skillId} · 步骤 ${t.stepId}`
+                    : t.skillId != null
+                      ? `技能 #${t.skillId}`
+                      : `步骤 ${t.stepId}`
+                }
+              >
+                {t.skillId != null ? `skill#${t.skillId}` : ''}
+                {t.stepId ? ` ${t.stepId}` : ''}
+              </span>
+            )}
           </div>
         ))}
       </div>

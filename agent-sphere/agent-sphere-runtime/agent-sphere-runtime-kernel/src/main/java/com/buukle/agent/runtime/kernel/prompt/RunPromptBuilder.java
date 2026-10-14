@@ -67,19 +67,6 @@ public class RunPromptBuilder {
                 + RunnerConstants.PROMPT_TODOLIST_INSTRUCTION;
     }
 
-    /** 技能槽后缀（技能名/版本 + 大纲）。 */
-    public String buildSkillSlotSuffix(String skillSlotText) {
-        if (skillSlotText == null || skillSlotText.isBlank()) {
-            return null;
-        }
-        return RunnerConstants.PROMPT_SKILL_SLOT_HEADER + skillSlotText;
-    }
-
-    /** 判断消息是否技能槽（以 header marker 开头）。 */
-    public boolean isSkillSlot(String content) {
-        return content != null && content.startsWith(RunnerConstants.PROMPT_SKILL_SLOT_HEADER);
-    }
-
     /** 判断消息是否待办槽（以 header marker 开头，用于原位定位/删除）。 */
     public boolean isTodolistSlot(String content) {
         return content != null && content.startsWith(RunnerConstants.PROMPT_TODOLIST_HEADER);

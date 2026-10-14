@@ -4,6 +4,20 @@
 
 - 默认使用中文回答用户；只有用户明确要求时才使用其他语言。
 
+## 第三方品牌 (no third-party brands in code)
+
+- **禁止**在代码、注释、Javadoc、日志文案、文档、测试夹具里出现「被自动化/对接的具体
+  第三方网站」的品牌名或域名（典型：招聘站点名、其主域与风控域）。目的是避免纠纷。
+- 需要指代具体站点时改用中性写法：
+  - 域名 → `example.com` / `host.example` 等占位；
+  - 判定用 URL/路径特征 → 泛化成不含品牌的特征（如把 `safe.<brand>.com` 写成匹配
+    `//safe.` 前缀 + 通用 `captcha`/`intercept` 片段），并保持原有检测语义；
+  - 确需固定的真实站点信息 → **移到配置**（`agent_system_config` / popup 设置 / yml），
+    代码里只留键名与默认值。
+- 本规则是**全仓**约束，四个子项目都适用。
+- **已应用的 Flyway 迁移不可改写**（只可新增迁移）。若历史 seed 里含品牌，新增一版
+  迁移去改写，或按需从配置读取 —— 不要直接编辑 `V*.sql`。
+
 Git root holds four **independent** projects (no shared root build/lockfile):
 - `agent-sphere/` — Java 21 / Spring Boot backend. **See `agent-sphere/AGENTS.md`** for module layout, Maven commands, Flyway, MyBatis-Plus, and code-style rules.
 - `agent-sphere-ui/` — React 19 / UmiJS Max frontend (Ant Design Pro base).

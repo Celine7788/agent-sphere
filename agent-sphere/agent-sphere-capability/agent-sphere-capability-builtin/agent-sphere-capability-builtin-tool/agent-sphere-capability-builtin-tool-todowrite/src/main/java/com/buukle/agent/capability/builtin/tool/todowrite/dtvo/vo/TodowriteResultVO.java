@@ -22,5 +22,7 @@ public class TodowriteResultVO extends ExecuteResult {
         private String content;
         private String status;
         private String priority;
+        private Long skillId;
+        private String stepId;
     }
 }

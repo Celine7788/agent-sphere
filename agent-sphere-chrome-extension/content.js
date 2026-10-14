@@ -639,17 +639,6 @@
           };
         }
 
-      case 'wait': {
-          // wait(ms) 固定等待；或 wait(selector|text|ref, timeout) 等待元素出现
-          if (params.selector || params.text || params.ref != null) {
-            const el = await AS.waitForElement(params, params.timeout || 8000, 200);
-            return { success: true, data: { _url: location.href, _title: document.title, found: !!el, ...pageHints() } };
-          }
-          const ms = Math.min(params.ms || 1000, 30000);
-          await new Promise((r) => setTimeout(r, ms));
-          return { success: true, data: { _url: location.href, _title: document.title, ...pageHints() } };
-        }
-
         case 'scroll': {
           const dir = params.direction || 'down';
           if (params.selector || params.text || params.ref != null) {

@@ -8,7 +8,8 @@ public enum BuiltinToolEnum {
     DOCWRITE(6),
     ASK_CLARIFICATION(7),
     SKILL_LIBRARY(8),
-    SKILL_MANAGE(9);
+    SKILL_MANAGE(9),
+    WAIT(10);
 
     private final int id;
 

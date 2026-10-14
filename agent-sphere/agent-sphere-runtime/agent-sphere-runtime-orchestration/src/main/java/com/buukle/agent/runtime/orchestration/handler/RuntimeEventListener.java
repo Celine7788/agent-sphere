@@ -87,6 +87,7 @@ public class RuntimeEventListener {
             case FAILED -> RuntimeEventTypeConstant.REASONING_SUB_TYPE_RUN_FAILED;
             case CANCELLED -> RuntimeEventTypeConstant.REASONING_SUB_TYPE_RUN_CANCELLED;
             case AWAITING_USER -> RuntimeEventTypeConstant.REASONING_SUB_TYPE_RUN_AWAITING_USER;
+            case WAITING -> RuntimeEventTypeConstant.REASONING_SUB_TYPE_RUN_WAITING;
         };
     }
 
@@ -222,6 +223,13 @@ public class RuntimeEventListener {
                 timelineRecorder.recordRunTerminal(data.getSessionId(), run.getId(), status);
             }
             case AWAITING_USER -> {
+                run.setStatus(status.value());
+                runSpi.updateRun(run);
+                timelineRecorder.recordRunTerminal(data.getSessionId(), run.getId(), status);
+            }
+            case WAITING -> {
+                // wait 挂起：与 AWAITING_USER 同属停车态 —— 更新 run 状态 + 记 timeline“等待中”行；
+                // 之后同一个 run 到点续跑，行会原位更新。
                 run.setStatus(status.value());
                 runSpi.updateRun(run);
                 timelineRecorder.recordRunTerminal(data.getSessionId(), run.getId(), status);

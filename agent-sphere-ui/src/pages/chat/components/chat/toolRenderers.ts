@@ -4,8 +4,9 @@
  *
  * 依据后端 AgentTimelineVO.content（tool 行）字段：
  *   displayName, status, args(JSON 字符串), artifact(JSON 字符串)
- * - todo 工具 args: { "todos": [{ "content","status","priority" }] }
+ * - todo 工具 args: { "todos": [{ "content","status","priority","skillId","stepId" }] }
  *   status ∈ pending|in_progress|completed|cancelled; priority ∈ high|medium|low
+ *   skillId/stepId 仅在条目来自某技能步骤时存在（用于标识来源技能与步骤）
  * - doc 工具 args: { "action","title","content","documentId", ... }  action ∈ create|update|read|...
  */
 
@@ -13,6 +14,10 @@ export interface TodoItem {
   content: string;
   status?: string;
   priority?: string;
+  /** 来源技能 id；非技能条目为 undefined/null。 */
+  skillId?: number | null;
+  /** 来源技能步骤标识，如 step1 / step1.1。 */
+  stepId?: string | null;
 }
 
 export interface ToolContent {
@@ -74,6 +79,8 @@ export function extractTodos(content: ToolContent): TodoItem[] {
           : '未命名任务',
     status: t?.status,
     priority: t?.priority,
+    skillId: t?.skillId ?? null,
+    stepId: t?.stepId ?? null,
   }));
 }
 

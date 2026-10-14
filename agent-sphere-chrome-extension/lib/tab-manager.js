@@ -78,6 +78,28 @@ export class TabManager {
   }
 
   /**
+   * 把受控 tab 切到前台（其所在窗口内的活动 tab）。
+   *
+   * <p>后台 tab 会被 Chrome 节流：`requestAnimationFrame` 暂停、`setTimeout` 钳到 ≥1s
+   * （隐藏满 5 分钟进一步降到约 1 次/分钟）。而本插件的几个稳定性等待全部依赖 rAF +
+   * setTimeout —— 元素几何收敛帧（waitStableRect）、光标到达动画 —— 后台下每条写动作
+   * 都要白白多花数秒，叠加后频繁撞上后端的动作超时。
+   *
+   * <p>刻意只 `tabs.update({active:true})`、不 `windows.update({focused:true})`：
+   * 窗口可见但非聚焦时，活动 tab 通常已算 `visible`，既解除节流又不抢用户的 OS 焦点。
+   */
+  async ensureForeground(tabId) {
+    if (!tabId) return;
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      if (!tab || tab.active) return;
+      await chrome.tabs.update(tabId, { active: true });
+    } catch (e) {
+      // tab 已关闭或不归本窗口管：不阻断调用方，后续动作各自报错即可
+    }
+  }
+
+  /**
    * Normalise a URL for equality comparison when reusing tabs.
    * The old check was a raw `tab.url === params.url` string compare, which missed
    * every tab differing only by hash / protocol / www / trailing slash.

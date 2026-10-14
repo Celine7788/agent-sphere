@@ -6,6 +6,10 @@ interface TodoItem {
   content: string;
   status: string;
   priority: string;
+  /** 来源技能 id；非技能条目为 null/undefined。 */
+  skillId?: number | null;
+  /** 来源技能步骤标识，如 step1 / step1.1。 */
+  stepId?: string | null;
 }
 
 interface ToolCallItem {
@@ -189,6 +193,22 @@ export default function SessionPanel({
                 >
                   {t.content}
                 </span>
+                {(t.skillId != null || t.stepId) && (
+                  <Tag
+                    color="purple"
+                    style={{ fontSize: 10, marginLeft: 4, lineHeight: '16px' }}
+                    title={
+                      t.skillId != null && t.stepId
+                        ? `技能 #${t.skillId} · 步骤 ${t.stepId}`
+                        : t.skillId != null
+                          ? `技能 #${t.skillId}`
+                          : `步骤 ${t.stepId}`
+                    }
+                  >
+                    {t.skillId != null ? `skill#${t.skillId}` : ''}
+                    {t.stepId ? ` ${t.stepId}` : ''}
+                  </Tag>
+                )}
                 <Tag
                   style={{ fontSize: 10, marginLeft: 4, lineHeight: '16px' }}
                   color={

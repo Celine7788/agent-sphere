@@ -48,6 +48,8 @@ public class SessionTodoServiceImpl implements SessionTodoSpi {
             e.setContent(t.getContent());
             e.setStatus(t.getStatus());
             e.setPriority(t.getPriority());
+            e.setSkillId(t.getSkillId());
+            e.setStepId(t.getStepId());
             e.setSortOrder(0);
             if (creator != null) e.setCreatedBy(creator);
             return e;
@@ -73,6 +75,8 @@ public class SessionTodoServiceImpl implements SessionTodoSpi {
                     vo.setStatus(e.getStatus());
                     vo.setPriority(e.getPriority());
                     vo.setSortOrder(e.getSortOrder());
+                    vo.setSkillId(e.getSkillId());
+                    vo.setStepId(e.getStepId());
                     return vo;
                 }).toList();
     }

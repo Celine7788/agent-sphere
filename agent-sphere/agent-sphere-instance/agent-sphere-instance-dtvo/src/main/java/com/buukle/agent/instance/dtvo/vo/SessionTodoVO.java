@@ -13,6 +13,10 @@ public class SessionTodoVO implements Serializable {
     private String status;
     private String priority;
     private Integer sortOrder;
+    /** 来源技能 id（非技能条目为 null）。 */
+    private Long skillId;
+    /** 来源技能步骤标识，如 step1 / step1.1（非技能条目为 null）。 */
+    private String stepId;
 
     public SessionTodoVO() {
     }

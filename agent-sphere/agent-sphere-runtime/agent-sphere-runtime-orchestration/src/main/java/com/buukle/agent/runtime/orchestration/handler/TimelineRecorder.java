@@ -39,6 +39,7 @@ public class TimelineRecorder {
     private static final String TITLE_RUN_FAILED = "❌ 执行失败";
     private static final String TITLE_RUN_CANCELLED = "⏹️ 已取消";
     private static final String TITLE_RUN_AWAITING = "⏸️ 等待澄清";
+    private static final String TITLE_RUN_WAITING = "⏳ 等待中（到点自动继续）";
 
     /** 直接记录一行（chat 用户消息 / 子 Agent 头行等），返回 seq。 */
     public long record(Long sessionId, Long runId, String kind, String subtype, String state, String title,
@@ -147,6 +148,7 @@ public class TimelineRecorder {
             case FAILED -> TimelineState.FAILED.getCode();
             case CANCELLED -> TimelineState.CANCELLED.getCode();
             case AWAITING_USER -> "AWAITING_USER";
+            case WAITING -> "WAITING";
             default -> status.name();
         };
         String title = switch (status) {
@@ -154,13 +156,14 @@ public class TimelineRecorder {
             case FAILED -> TITLE_RUN_FAILED;
             case CANCELLED -> TITLE_RUN_CANCELLED;
             case AWAITING_USER -> TITLE_RUN_AWAITING;
+            case WAITING -> TITLE_RUN_WAITING;
             default -> throw new IllegalStateException("unexpected run status " + status);
         };
         Long seq = runStatusSeqByRun.get(runId);
         if (seq != null) {
             timelineSpi.update(sessionId, seq, state, state, title);
-            // AWAITING_USER 之后还可能续跑同一行；仅真正终态释放 map 条目
-            if (!"AWAITING_USER".equals(state)) {
+            // AWAITING_USER / WAITING 之后还会续跑同一行；仅真正终态释放 map 条目
+            if (!"AWAITING_USER".equals(state) && !"WAITING".equals(state)) {
                 runStatusSeqByRun.remove(runId, seq);
             }
         } else {

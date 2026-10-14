@@ -5,6 +5,7 @@ import com.buukle.agent.common.context.AuthContext;
 import com.buukle.agent.common.error.CommonErrorCode;
 import com.buukle.agent.common.exception.BizException;
 import com.buukle.agent.instance.domain.AgentPendingClarification;
+import com.buukle.agent.instance.dtvo.vo.PendingWaitVO;
 import com.buukle.agent.instance.dtvo.dto.CreateRunDTO;
 import com.buukle.agent.instance.dtvo.dto.SendMessageDTO;
 import com.buukle.agent.instance.dtvo.enums.RunEnum;
@@ -14,13 +15,16 @@ import com.buukle.agent.instance.dtvo.vo.RunAttachment;
 import com.buukle.agent.instance.dtvo.vo.RunVO;
 import com.buukle.agent.instance.dtvo.vo.SessionVO;
 import com.buukle.agent.instance.repository.AgentPendingClarificationMapper;
+import com.buukle.agent.instance.spi.PendingWaitSpi;
 import com.buukle.agent.instance.spi.RunSpi;
 import com.buukle.agent.instance.spi.SessionSpi;
 import com.buukle.agent.runtime.kernel.constants.ChatClarification;
 import com.buukle.agent.runtime.kernel.constants.RunnerConstants;
 import com.buukle.agent.runtime.kernel.constants.RuntimeEventTypeConstant;
+import com.buukle.agent.runtime.kernel.constants.WaitConstants;
 import com.buukle.agent.runtime.kernel.port.vo.ClarificationStatus;
 import com.buukle.agent.runtime.kernel.port.vo.RunStatus;
+import com.buukle.agent.runtime.kernel.port.vo.ToolCallStatus;
 import com.buukle.agent.runtime.kernel.port.vo.RuntimeEventDataVO;
 import com.buukle.agent.runtime.kernel.port.vo.RuntimeEventVO;
 import com.buukle.agent.runtime.kernel.runner.SessionRunner;
@@ -49,6 +53,8 @@ public class ChatRuntimeService {
     private final SessionRunner sessionRunner;
     private final TimelineRecorder timelineRecorder;
     private final ChatAttachmentService chatAttachmentService;
+    /** 停止 WAITING 停车态的 run 时，取消其名下未唤醒的挂起记录，避免 waker 恢复已停止的 run。 */
+    private final PendingWaitSpi pendingWaitSpi;
 
     public ChatMessageResponseVO chat(Long sessionId, SendMessageDTO dto) {
         log.info("Chat request: sessionId={}, message={}", sessionId, dto.getMessage());
@@ -124,6 +130,59 @@ public class ChatRuntimeService {
         orchestrator.asyncHandleUserMessage(run, sessionId, dto.getMessage(), dto.getModelRouteId(),
                 isClarificationResume, chatAttachmentService.resolve(dto.getAttachmentKeys()));
         log.info("Async execution started for runId={}", run.getId());
+    }
+
+    /**
+     * wait 等待到期：把那次 wait 的工具结果补成「已等待」，并恢复原 run。
+     *
+     * <p>不复用 {@link #resumeFromClarification}，因为两者恢复语义不同：澄清恢复要
+     * 带用户应答文本并重建澄清行；这里没有用户输入，只是把一个已经返回
+     * {@code {"status":"waiting"}} 的工具调用补上最终结果，然后重新推进循环。
+     *
+     * <p>调用方必须已用 {@code PendingWaitSpi#claimForResume} 抢占成功 —— 内存定时器与
+     * cron 补偿会同时命中同一条记录，没有抢占就会把同一个 run 恢复两次。
+     */
+    public void resumeFromWait(PendingWaitVO wait) {
+        Long sessionId = wait.getSessionId();
+        Long runId = wait.getRunId();
+        String callId = wait.getCallId();
+
+        // 补齐 wait 那条 tool call 的结果：模型恢复后由 HistoryLoader 读到它，
+        // 看到的是「已等待 N 秒」而不是悬空的 {"status":"waiting"}。
+        // 走事件而非直接改库：RuntimeEventListener 的 SUCCEEDED 分支会一并
+        // updateStatus/updateCompressedArtifact + 收 timeline 行 + 广播前端，一次事件全做完。
+        if (callId != null && !callId.isBlank()) {
+            String artifact = "{\"status\":\"waiting\",\"elapsed_ms\":" + wait.getWaitMs() + ",\"resumed_at\":\""
+                    + java.time.LocalDateTime.now() + "\"}";
+            eventPublisher.publishEvent(new RuntimeEventVO(ToolCallStatus.SUCCEEDED,
+                    new RuntimeEventDataVO()
+                            .setSessionId(sessionId)
+                            .setRunId(runId)
+                            .setToolName(WaitConstants.TOOL_NAME)
+                            .setDisplayNameCn(WaitConstants.DISPLAY_NAME_CN)
+                            .setDisplayNameEn(WaitConstants.DISPLAY_NAME)
+                            .setArtifact(artifact)
+                            .setPublishId(RuntimeEventTypeConstant.PUBLISH_ID_TOOL + callId)));
+        }
+
+        RunVO run = runSpi.getRun(runId);
+        if (run == null) {
+            log.warn("Wait wake skipped: run {} no longer exists", runId);
+            return;
+        }
+        if (!RunStatus.WAITING.name().equals(run.getStatus())) {
+            // 已被取消/收口，或已被另一条路径唤醒：不再重复推进
+            log.info("Wait wake skipped: runId={} status={} (expected {})", runId, run.getStatus(), RunStatus.WAITING);
+            return;
+        }
+        run.setStatus(RunStatus.RUNNING.name());
+        runSpi.updateRun(run);
+
+        sessionSpi.touchSession(sessionId);
+        orchestrator.asyncHandleUserMessage(run, sessionId,
+                WaitConstants.WAIT_RESUME_PREFIX + wait.getWaitMs() + "ms elapsed.", null, true, List.of());
+        log.info("Wait resumed: waitId={} runId={} sessionId={} waitedMs={}",
+                wait.getId(), runId, sessionId, wait.getWaitMs());
     }
 
     public ChatMessageResponseVO resumeFromClarification(Long sessionId, Long runId, String response, String clarificationId) {
@@ -221,8 +280,10 @@ public class ChatRuntimeService {
             // 否则前端会一直定格在待澄清/「执行中」。
             sessionRunner.clearSessionCancelled(sessionId);
             dismissPendingClarifications(sessionId);
-        } else if (RunStatus.AWAITING_USER.name().equals(active.getStatus())) {
-            // 停车态：loop 已退出，标志不会生效 → 复用 stopRun 的澄清取消逻辑后清除标志
+        } else if (RunStatus.AWAITING_USER.name().equals(active.getStatus())
+                || RunStatus.WAITING.name().equals(active.getStatus())) {
+            // 停车态（等人 / 等时间）：loop 已退出，标志不会生效 → 复用 stopRun 的停车态
+            // 收口（置 CANCELLED + 清挂起 + 发终态）后清除标志。
             stopRun(sessionId, active.getId());
             sessionRunner.clearSessionCancelled(sessionId);
         } else {
@@ -238,7 +299,12 @@ public class ChatRuntimeService {
         RunVO run = runSpi.getRun(runId);
         if (run == null) return;
 
-        if (RunStatus.AWAITING_USER.name().equals(run.getStatus())) {
+        if (RunStatus.AWAITING_USER.name().equals(run.getStatus())
+                || RunStatus.WAITING.name().equals(run.getStatus())) {
+            // 停车态（等人 / 等时间）：loop 已退出，取消标志无消费者 → 直接置终态。
+            // 1) 置 CANCELLED；
+            // 2) dismiss 未应答澄清（等人态）；取消未唤醒的挂起记录（等时间态）—— 两者都清，幂等；
+            // 3) 发 run_cancelled 终态事件，前端据此解锁并显示“已取消”。
             run.setStatus(RunStatus.CANCELLED.name());
             runSpi.updateRun(run);
 
@@ -255,6 +321,11 @@ public class ChatRuntimeService {
                                 .setSessionId(sessionId)
                                 .setRunId(runId)
                                 .setClarificationId(pending.getClarificationId())));
+            }
+
+            int cancelledWaits = pendingWaitSpi.cancelPendingByRunId(runId);
+            if (cancelledWaits > 0) {
+                log.info("Stop run {}: cancelled {} pending wait record(s)", runId, cancelledWaits);
             }
 
             eventPublisher.publishEvent(new RuntimeEventVO(

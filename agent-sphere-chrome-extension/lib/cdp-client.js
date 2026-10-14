@@ -18,9 +18,9 @@
 const CDP_OP_TIMEOUT_MS = 15000;
 
 // ---- 拟人化参数（技术侧；业务节奏由 skill 定义，这里只做"真实输入"与硬地板）----
-// 点击落点在元素坐标上的随机偏移（像素）。刻意取小值：足够避免"像素级正中"，
-// 又不至于点空（按钮/卡片通常 ≥20px）；点空会由 changed/_clickable 反馈暴露。
-const CLICK_JITTER_PX = 2;
+// 落点精确：不再对元素坐标做像素抖动。曾经的 ±CLICK_JITTER_PX 会让小目标
+// （勾选框/小图标）点空 —— 屏幕光标画在精确目标点，点击就必须落在同一点。
+// 拟人化只保留"移动"层：起点偏移 + 向量轨迹（见 nativeClick / _moveMouse）。
 // 向量轨迹的步数与每步间隔：约 8 步 × 8~22ms ≈ 100~180ms，肉眼是"移过去"而非瞬移。
 const TRAJECTORY_STEPS = 8;
 
@@ -280,8 +280,9 @@ export class CdpClient {
     return this._serialized(async () => {
       try {
         await this.attach(tabId);
-        const tx = Math.max(0, x + randInt(-CLICK_JITTER_PX, CLICK_JITTER_PX));
-        const ty = Math.max(0, y + randInt(-CLICK_JITTER_PX, CLICK_JITTER_PX));
+        // 落点精确：直接点元素坐标，不做像素抖动（见文件头拟人化参数说明）。
+        const tx = Math.max(0, x);
+        const ty = Math.max(0, y);
         // 起点在目标附近（模拟"从旁边的上一次位置移过来"），无需额外查询视口尺寸
         const sx = Math.max(0, tx + randInt(-120, 120));
         const sy = Math.max(0, ty + randInt(-90, 90));
