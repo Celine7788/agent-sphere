@@ -1,6 +1,10 @@
 package com.buukle.agent.runtime.kernel.runner;
 
 import com.buukle.agent.capability.builtin.dtvo.enums.BuiltinToolEnum;
+import com.buukle.agent.capability.skill.dtvo.vo.SkillVO;
+import com.buukle.agent.capability.skill.spi.CapabilitySkillSpi;
+import com.buukle.agent.common.skill.SkillDefinition;
+import com.buukle.agent.common.skill.SkillDefinitionParser;
 import com.buukle.agent.common.config.AgentRuntimeProperties;
 import com.buukle.agent.common.context.TaskLoopLimitHolder;
 import com.buukle.agent.common.eventbus.DistributedRuntimeConstants;
@@ -79,6 +83,7 @@ public class SessionRunner {
     private final ToolExecutor toolExecutor;
     private final TitleService titleService;
     private final AgentToolCallRecordSpi toolCallRecordSpi;
+    private final CapabilitySkillSpi skillSpi;
     private final RedissonClient redissonClient;
     private final ChatAttachmentResolver attachmentResolver;
     private final LlmRequestConfigurer llmRequestConfigurer;
@@ -243,6 +248,9 @@ public class SessionRunner {
                         .setContent(runPromptBuilder.currentTimeText()));
                 // 待办列表独立为尾部 system 段（原位替换，不触碰 index 0，保持前缀缓存稳定）
                 applyTodolistSuffix(messages, todolistText);
+                // 技能槽：首次装配时通常还没读技能（返回 null → 不加槽），
+                // 待模型调用 skill_library 后会在此后的轮次刷新出来。
+                applySkillSlot(messages, loadSkillSlotText(sessionId));
             }
 
             List<RuntimeTool> tools = ctx != null ? ctx.getTools() : List.of();
@@ -299,6 +307,9 @@ public class SessionRunner {
                                 .setRole(LlmApiConstant.ROLE_SYSTEM)
                                 .setContent(runPromptBuilder.currentTimeText()));
                         applyTodolistSuffix(messages, todolistText);
+                // 技能槽：首次装配时通常还没读技能（返回 null → 不加槽），
+                // 待模型调用 skill_library 后会在此后的轮次刷新出来。
+                applySkillSlot(messages, loadSkillSlotText(sessionId));
                         hasToolCalls = true;
                         continue;
                     }
@@ -333,6 +344,7 @@ public class SessionRunner {
                                     .setRunId(currentRunId)
                                     .setAssistantReply(currentRun.getAssistantReply())
                                     .setPublishId(RuntimeEventTypeConstant.PUBLISH_ID_RUN + currentRunId)));
+                    logSkillCompliance(sessionId, currentRunId);
                     break loop;
                 }
                 case CANCELLED -> {
@@ -468,7 +480,9 @@ public class SessionRunner {
                         RunnerConstants.JSON_ERROR_TOOL_LOST);
                 String toolMessage = toolResult;
                 if (tc.name().equals(InstanceCapabilityEnum.LLM_PREFIX_BUILTIN + BuiltinToolEnum.TODOWRITE.getId())) {
-                    toolMessage = toolResult + "\n\n**Reminder: If you completed a task, update its status to 'completed' by calling " + InstanceCapabilityEnum.LLM_PREFIX_BUILTIN + BuiltinToolEnum.TODOWRITE.getId() + " again.**";
+                    toolMessage = toolResult + "\n\n**Reminder: keep this list in sync with actual progress (update statuses by calling "
+                            + InstanceCapabilityEnum.LLM_PREFIX_BUILTIN + BuiltinToolEnum.TODOWRITE.getId()
+                            + " again). A fully completed list is PROGRESS ONLY — it does NOT by itself finish the task; completion follows the task instructions (and, when a skill applies, the skill's closing conditions / expected output).**";
                 }
                 messages.add(new ChatMessageDTO()
                         .setRole(LlmApiConstant.ROLE_TOOL)
@@ -499,6 +513,14 @@ public class SessionRunner {
                 } catch (Exception e) {
                     log.warn("Failed to refresh todolist for session {}", sessionId, e);
                 }
+            }
+
+            // 技能被读取后，刷新受保护的「技能槽」（技能名/版本 + 大纲），
+            // 使其跨 run 常驻，避免大技能正文被历史压缩砍掉后模型丢规则。
+            boolean skillLibraryCalled = turn.toolCalls().stream().anyMatch(tc ->
+                    tc.name().equals(InstanceCapabilityEnum.LLM_PREFIX_BUILTIN + BuiltinToolEnum.SKILL_LIBRARY.getId()));
+            if (skillLibraryCalled && !messages.isEmpty()) {
+                applySkillSlot(messages, loadSkillSlotText(sessionId));
             }
 
             // 最后一轮工具执行后，直接结束
@@ -586,6 +608,170 @@ public class SessionRunner {
             return;
         }
         // 无已有槽：优先插在 FINAL_TURN 收口指令之前，保证待办是"最末可见 system"之一
+        int insertAt = messages.size();
+        Object last = messages.get(messages.size() - 1).getContent();
+        if (last instanceof String s && RunnerConstants.FINAL_TURN_INSTRUCTION.equals(s)) {
+            insertAt = messages.size() - 1;
+        }
+        messages.add(insertAt, new ChatMessageDTO()
+                .setRole(LlmApiConstant.ROLE_SYSTEM)
+                .setContent(suffix));
+    }
+
+    /** 技能大纲用的标题行（#/##/###…）与 skillId 抽取。 */
+    private static final java.util.regex.Pattern SKILL_HEADING =
+            java.util.regex.Pattern.compile("^(#{1,6})\\s+(.+)$");
+    private static final java.util.regex.Pattern SKILL_ID_ARG =
+            java.util.regex.Pattern.compile("\"skillId\"\\s*:\\s*(\\d+)");
+
+    /**
+     * 组装「技能槽」文本：本任务已读取的技能名/版本 + 大纲（H2/H3 + 行号）。
+     *
+     * <p>目的有二：
+     * <ol>
+     *   <li><b>抗压缩</b>：大技能正文跨 run 重放时会被 {@code ToolResultCompressor} 按 2000 字符
+     *       压成"头 100 + 尾 50"，模型会丢规则；把<b>大纲</b>放进受保护槽每轮原位刷新即可常驻，
+     *       正文改为按需 {@code get(sectionHeading=…)} 小片段读取；</li>
+     *   <li><b>可验证</b>：槽里写明用了哪个技能（名+版本），配合 {@code agent_tool_call_record}
+     *       可以核对"是否真的读了技能"。</li>
+     * </ol>
+     *
+     * <p>任何异常都吞掉返回 null —— 技能槽缺省不能影响主流程。
+     */
+    private String loadSkillSlotText(Long sessionId) {
+        if (sessionId == null) {
+            return null;
+        }
+        try {
+            AgentToolCallRecordVO rec = toolCallRecordSpi.getLatestBySessionAndToolName(
+                    sessionId, InstanceCapabilityEnum.LLM_PREFIX_BUILTIN + BuiltinToolEnum.SKILL_LIBRARY.getId());
+            if (rec == null || rec.getArgumentsJson() == null) {
+                return null;
+            }
+            java.util.regex.Matcher m = SKILL_ID_ARG.matcher(rec.getArgumentsJson());
+            if (!m.find()) {
+                return null;
+            }
+            Long skillId = Long.valueOf(m.group(1));
+            SkillVO skill = skillSpi.getSkill(skillId);
+            if (skill == null) {
+                return null;
+            }
+            StringBuilder sb = new StringBuilder();
+            sb.append("技能：").append(skill.getName() == null ? ("#" + skillId) : skill.getName());
+            if (skill.getVersion() != null) {
+                sb.append(" (v").append(skill.getVersion()).append(')');
+            }
+            sb.append('\n');
+            String prompt = promptTemplateOf(skill.getDefinition());
+            if (prompt != null) {
+                String[] lines = prompt.split("\n", -1);
+                for (int i = 0; i < lines.length; i++) {
+                    java.util.regex.Matcher h = SKILL_HEADING.matcher(lines[i]);
+                    if (h.matches()) {
+                        int level = h.group(1).length();
+                        if (level <= 3) { // H1 太长（技能名），H2/H3 是步骤与子步骤
+                            sb.append("  ".repeat(Math.max(0, level - 1)))
+                              .append("- ").append(h.group(2).trim())
+                              .append("  (L").append(i + 1).append(")\n");
+                        }
+                    }
+                }
+            }
+            sb.append("执行某步骤前，先 get(sectionHeading=\"stepN\") 读取该节正文（含其下全部子步骤）。");
+            return sb.toString();
+        } catch (Exception e) {
+            log.warn("loadSkillSlotText failed sessionId={}", sessionId, e);
+            return null;
+        }
+    }
+
+    /**
+     * P5：技能执行一致性（**仅日志**，不写 remark/stopReason）。
+     *
+     * <p>判据（宽松、可计算、不依赖模型自述）：
+     * <ul>
+     *   <li>{@code skillReads=0} → 整个 run 从未读取技能（最强信号）；</li>
+     *   <li>{@code writesBeforeSkillRead>0} → 在读取技能之前就已产生写动作（未按技能执行）。</li>
+     * </ul>
+     * 输出固定标记 {@code [SKILL_COMPLIANCE]}，事后可 grep / 聚合。
+     */
+    private void logSkillCompliance(Long sessionId, Long runId) {
+        try {
+            List<AgentToolCallRecordVO> recs = toolCallRecordSpi.listBySessionId(sessionId, runId);
+            if (recs == null || recs.isEmpty()) {
+                return;
+            }
+            String skillTool = InstanceCapabilityEnum.LLM_PREFIX_BUILTIN + BuiltinToolEnum.SKILL_LIBRARY.getId();
+            String chromeTool = InstanceCapabilityEnum.LLM_PREFIX_BUILTIN + BuiltinToolEnum.CHROME.getId();
+            int skillReads = 0;
+            int chromeWrites = 0;
+            int writesBeforeSkillRead = 0;
+            boolean firstReadSeen = false;
+            for (AgentToolCallRecordVO r : recs) {
+                String name = r.getToolName();
+                if (skillTool.equals(name)) {
+                    skillReads++;
+                    firstReadSeen = true;
+                } else if (chromeTool.equals(name)) {
+                    String args = r.getArgumentsJson() == null ? "" : r.getArgumentsJson();
+                    if (isChromeWriteAction(args)) {
+                        chromeWrites++;
+                        if (!firstReadSeen) {
+                            writesBeforeSkillRead++;
+                        }
+                    }
+                }
+            }
+            log.info("[SKILL_COMPLIANCE] session={} run={} skillReads={} chromeWrites={} writesBeforeSkillRead={}",
+                    sessionId, runId, skillReads, chromeWrites, writesBeforeSkillRead);
+        } catch (Exception e) {
+            log.warn("[SKILL_COMPLIANCE] analysis failed session={} run={}", sessionId, runId, e);
+        }
+    }
+
+    /** chrome 写动作判定（按 argumentsJson 的 action 字段；与 chrome 工具的 ACTION_* 对齐）。 */
+    private static boolean isChromeWriteAction(String args) {
+        return args.contains("\"action\":\"click\"")
+                || args.contains("\"action\":\"type\"")
+                || args.contains("\"action\":\"key\"")
+                || args.contains("\"action\":\"hover\"")
+                || args.contains("\"action\":\"clickAt\"");
+    }
+
+    private static String promptTemplateOf(String definition) {
+        try {
+            SkillDefinition def = SkillDefinitionParser.parse(definition);
+            return def == null ? null : def.promptTemplate();
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** 技能槽的注入/刷新/删除，与 {@link #applyTodolistSuffix} 同构。 */
+    private void applySkillSlot(List<ChatMessageDTO> messages, String skillSlotText) {
+        if (messages == null) {
+            return;
+        }
+        String suffix = runPromptBuilder.buildSkillSlotSuffix(skillSlotText);
+        int existingSlot = -1;
+        for (int i = 0; i < messages.size(); i++) {
+            Object content = messages.get(i).getContent();
+            if (content instanceof String s && runPromptBuilder.isSkillSlot(s)) {
+                existingSlot = i;
+                break;
+            }
+        }
+        if (suffix == null) {
+            if (existingSlot >= 0) {
+                messages.remove(existingSlot);
+            }
+            return;
+        }
+        if (existingSlot >= 0) {
+            messages.get(existingSlot).setContent(suffix);
+            return;
+        }
         int insertAt = messages.size();
         Object last = messages.get(messages.size() - 1).getContent();
         if (last instanceof String s && RunnerConstants.FINAL_TURN_INSTRUCTION.equals(s)) {

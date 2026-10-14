@@ -35,6 +35,42 @@ let commandInFlightAt = 0;
 // 让后端 LLM 决定等待还是先 getContent 复核，而不是连续空发。
 let commandActive = null;
 
+// ---- 节流地板（技术侧安全网）----
+// 业务节奏由 skill 定义（更大值）；扩展只保证"下限"，避免完全无节流。
+// 读动作互相 ≥1.5s，写动作 ≥3s，收藏类 ≥10s（按 text/selector 是否含"收藏"启发式判定）。
+const THROTTLE_READ_MS = 1500;
+const THROTTLE_WRITE_MS = 3000;
+const THROTTLE_FAVORITE_MS = 10000;
+let lastCommandAt = 0;
+
+function throttleFloorMs(action, params) {
+  const isWrite = WRITE_ACTIONS.has(action) || action === 'clickAt' || action === 'navigate';
+  if (!isWrite) return THROTTLE_READ_MS;
+  const hint = `${(params && params.text) || ''} ${(params && params.selector) || ''}`;
+  if (hint.includes('收藏') || /favorite/i.test(hint)) return THROTTLE_FAVORITE_MS;
+  return THROTTLE_WRITE_MS;
+}
+
+// ---- 风控命中（无人值守：命中即停）----
+// 判定：受控 tab 被重定向到猎聘安全中心/验证码页。命中后**按 session 锁定**，
+// 后续命令一律拒绝 —— 与产品口径「命中就停止，不做等待/重试/绕行」一致。
+const RISK_URL_PATTERNS = [/safe\.liepin\.com/i, /captchaPage/i, /\/v\/intercept\//i];
+const RISK_TITLE_PATTERNS = [/验证码/, /安全中心/];
+const riskLockedSessions = new Set();
+
+async function detectRiskChallenge(tabId) {
+  if (!tabId) return null;
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  if (!tab) return null;
+  const url = tab.url || '';
+  const title = tab.title || '';
+  const hit = RISK_URL_PATTERNS.some((re) => re.test(url))
+    || RISK_TITLE_PATTERNS.some((re) => re.test(title));
+  return hit ? { url, title } : null;
+}
+
+const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
+
 // --- Keep the offscreen document (SSE host) alive / recreate if the browser closed it ---
 function startOffscreenKeepalive() {
   chrome.alarms.create('offscreen-keepalive', { periodInMinutes: 1 });
@@ -261,6 +297,25 @@ function mapErrorCategory(e) {
 
 // --- Command execution ---
 async function executeInPage(commandId, action, params, sessionId) {
+  // 风控命中：按 session 锁定，之后一切命令直接拒绝（命中即停，不等待/不重试/不绕行）
+  const checkTabId = params.tabId || tabManager.getControlled();
+  if (sessionId && riskLockedSessions.has(sessionId)) {
+    const res = failResult('风控命中（会话已锁定）：页面曾被重定向到安全中心/验证码。请立即结束任务，不要重试或绕行。', 'risk_challenge');
+    sendCallbackSafe(commandId, res, checkTabId, sessionId);
+    return;
+  }
+  const riskHit = await detectRiskChallenge(checkTabId);
+  if (riskHit) {
+    if (sessionId) riskLockedSessions.add(sessionId);
+    const res = failResult(
+      `风控命中：受控页已被重定向（url=${riskHit.url}）。请立即结束任务（status=failed），不要重试。`,
+      'risk_challenge',
+    );
+    res.data = { _riskChallenge: true, _url: riskHit.url, _title: riskHit.title };
+    sendCallbackSafe(commandId, res, checkTabId, sessionId);
+    return;
+  }
+
   if (commandInFlightAt && Date.now() - commandInFlightAt < COMMAND_LEASE_MS) {
     const elapsed = Date.now() - commandInFlightAt;
     const running = (commandActive && commandActive.action) || 'unknown';
@@ -280,8 +335,15 @@ async function executeInPage(commandId, action, params, sessionId) {
   commandActive = { action, at: commandInFlightAt };
   const t0 = Date.now();
   try {
+    // 节流地板：与上一命令结束之间至少间隔 floor ms（业务节奏由 skill 定更大值）
+    const floor = throttleFloorMs(action, params);
+    if (lastCommandAt > 0) {
+      const gap = Date.now() - lastCommandAt;
+      if (gap < floor) await sleepMs(floor - gap);
+    }
     await executeInPageInner(commandId, action, params, sessionId);
   } finally {
+    lastCommandAt = Date.now();
     commandInFlightAt = 0;
     commandActive = null;
     console.log(`[ChromeCmd] action=${action} tab=${params.tabId || tabManager.getControlled() || '-'} ms=${Date.now() - t0}`);
@@ -479,7 +541,7 @@ async function cdpAct(tabId, action, params, loc) {
       await agentCursor.show(tabId, loc && loc.point);
       await cdpClient.nativeClick(tabId, loc.point.x, loc.point.y); // 先受信聚焦
       if (params.append !== true) await cdpClient.clearInput(tabId); // insertText 只追加，整字段替换前先清空
-      await cdpClient.insertText(tabId, params.text || '');
+      await cdpClient.typeText(tabId, params.text || ''); // 逐字输入（拟人化）
       if (params.submit) await cdpClient.nativeKeyPress(tabId, 'Enter', 'Enter', 13);
       break;
     case 'key': {
@@ -940,7 +1002,20 @@ const { nodes } = await cdpClient.sendCommand(targetTabId, 'Accessibility.getFul
       return;
     }
 
-    // 其余动作 → 内容脚本（只读 / wait / scroll / upload / dialog 等）
+    // 页面级滚动 → CDP mouseWheel（真实滚轮事件 + 分段停顿）；
+    // 对元素滚动（给了 selector/text/ref）仍走内容脚本的 scrollIntoView（那是定位动作，非人手势）
+    if (action === 'scroll' && !(params.selector || params.text || params.ref != null)) {
+      await cdpClient.scrollPage(targetTabId, params.direction || 'down', params.amount);
+      sendCallbackSafe(commandId, {
+        success: true,
+        action: 'scroll',
+        data: { scrolled: params.direction || 'down', method: 'cdp-wheel' },
+        detail: '',
+      }, targetTabId, sessionId);
+      return;
+    }
+
+    // 其余动作 → 内容脚本（只读 / wait / upload / dialog 等）
     const result = await tabManager.askContent(targetTabId, {
       type: 'browser_operation',
       action,

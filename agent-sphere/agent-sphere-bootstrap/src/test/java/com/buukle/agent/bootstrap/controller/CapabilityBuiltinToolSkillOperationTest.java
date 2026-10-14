@@ -45,7 +45,7 @@ class CapabilityBuiltinToolSkillOperationTest {
         skillSpi = mock(CapabilitySkillSpi.class);
         instanceCapabilitySpi = mock(InstanceCapabilitySpi.class);
         sessionSpi = mock(SessionSpi.class);
-        libraryTool = new CapabilityBuiltinToolSkillLibrary(skillSpi, instanceCapabilitySpi, sessionSpi);
+        libraryTool = new CapabilityBuiltinToolSkillLibrary(skillSpi, instanceCapabilitySpi, sessionSpi, mock(com.buukle.agent.instance.spi.SessionTodoSpi.class));
         manageTool = new CapabilityBuiltinToolSkillManage(skillSpi, instanceCapabilitySpi, sessionSpi);
     }
 

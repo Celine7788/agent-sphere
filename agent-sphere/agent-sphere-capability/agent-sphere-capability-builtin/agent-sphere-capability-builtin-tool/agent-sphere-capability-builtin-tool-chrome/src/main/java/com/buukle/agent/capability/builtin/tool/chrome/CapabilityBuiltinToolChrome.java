@@ -17,11 +17,13 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Component;
 
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.regex.Pattern;
 
 @Slf4j
 @Component
@@ -48,7 +50,7 @@ public class CapabilityBuiltinToolChrome implements CapabilityBuiltinToolSpi {
             + "9. upload(selector|ref, fileName, fileBase64, fileType?) — upload to an <input type=file> (drag-drop UIs).\n"
             + "10. wait(ms) or wait(selector|text|ref, timeout) — explicitly wait for dynamic content. Prefer explicit wait over blind retries.\n"
             + "11. closeDialogs — close open modal dialogs/toasts.\n"
-            + "12. executeJS — LAST RESORT (BLOCKED on strict-CSP sites). Code runs as an async block: you MUST `return` a JSON-serializable value. If it returns nothing you get data:'__NO_RETURN__' + `_documentTitle` — that means the script EXECUTED FINE but returned no value (NOT a failure), do NOT retry. To verify a side-effect, set `document.title='<token>|<state>'` inside the script and read `_documentTitle` back. If csp_blocked/detached, do NOT retry — re-read with getContent snapshot and use click/type.\n"
+            + "12. executeJS — LAST RESORT (BLOCKED on strict-CSP sites). READ-ONLY ONLY: it may read the DOM, compute, and `return` a small JSON-serializable value. NAVIGATION WRITES ARE REJECTED at the tool layer with errorCategory='js_navigation_blocked' — never use `location.*=`, `location.assign/replace/reload`, `history.pushState/replaceState/go/back/forward`, `window.open`, or `form.submit` inside executeJS; to open/return from a detail page use click on the real in-page control, and use navigate only for a full page load. Code runs as an async block: you MUST `return` a JSON-serializable value. If it returns nothing you get data:'__NO_RETURN__' + `_documentTitle` — that means the script EXECUTED FINE but returned no value (NOT a failure), do NOT retry. To verify a side-effect, set `document.title='<token>|<state>'` inside the script and read `_documentTitle` back. If csp_blocked/detached, do NOT retry — re-read with getContent snapshot and use click/type.\n"
             + "13. Tab following: a link opening a new tab auto-switches control (result includes _newTabId/_newTabUrl). Pass `tabId` to target a specific tab.\n"
             + "14. Per-command timeout: pass `timeout` (seconds, min 2, max 30) to override defaults (navigate 30s; wait 30s; executeJS 30s; others 10s) for slow re-renders. executeJS is capped at 27s inside the extension, so raising `timeout` beyond that has no effect — split long waits into several calls instead.\n"
             + "15. frameId: pass `frameId=0` to address the TOP frame only; leave null to broadcast across same-origin frames. Many modal dialogs render into the TOP-frame body — use frameId=0 + `_hints.dialogs`. Frames other than 0 are NOT addressable.\n"
@@ -93,6 +95,37 @@ public class CapabilityBuiltinToolChrome implements CapabilityBuiltinToolSpi {
     private static final String ERROR_CATEGORY_TIMEOUT = "timeout";
     private static final String ERROR_CATEGORY_CANCELLED = "cancelled";
     private static final String ERROR_CATEGORY_UNKNOWN = "unknown";
+    /** executeJS 里做导航写操作 —— 见 JS_NAVIGATION_WRITE_PATTERNS。 */
+    private static final String ERROR_CATEGORY_JS_NAVIGATION_BLOCKED = "js_navigation_blocked";
+
+    /**
+     * executeJS 的**执行范围**：只允许只读（读 DOM/取值/计算并 return 小 JSON）。
+     *
+     * <p>以下模式属于**导航写操作**，一律拒绝执行。原因：脚本式跳转（尤其
+     * {@code location.href = ...} 与 {@code history.back()}）会绕过真实点击链路与
+     * referer/点击语境，是最强的自动化指纹 —— 线上猎聘任务正是因此被判异常并跳
+     * {@code safe.liepin.com} 验证码。详情/返回必须走 click 与平台控件。
+     *
+     * <p>这是**防协作型 agent 走错路**，不是防对抗：静态字符串匹配足够，不追求不可绕过。
+     * <b>本清单是唯一权威出处</b>（插件端不再复制一份）。
+     */
+    private static final List<Pattern> JS_NAVIGATION_WRITE_PATTERNS = List.of(
+            // location.xxx = value  （href/hash/search/pathname/host/... 任一属性赋值都会触发导航）
+            Pattern.compile("location\\s*\\.\\s*[A-Za-z_$][\\w$]*\\s*=(?!=)"),
+            // location['xxx'] = value
+            Pattern.compile("location\\s*\\[[^\\]]+\\]\\s*=(?!=)"),
+            // location.assign( / replace( / reload(
+            Pattern.compile("location\\s*\\.\\s*(assign|replace|reload)\\s*\\("),
+            // document.location / window.location / top.location / self.location / parent.location 上的赋值
+            Pattern.compile("(document|window|top|self|parent)\\s*\\.\\s*location\\s*"
+                    + "(\\.\\s*[A-Za-z_$][\\w$]*\\s*=|\\[[^\\]]+\\]\\s*=|=(?!=))"),
+            // history 导航
+            Pattern.compile("history\\s*\\.\\s*(pushState|replaceState|go|back|forward)\\s*\\("),
+            // 新窗口
+            Pattern.compile("window\\s*\\.\\s*open\\s*\\("),
+            // 表单提交（会整页导航）
+            Pattern.compile("\\.\\s*submit\\s*\\(")
+    );
 
     @Autowired
     private ApplicationEventPublisher eventPublisher;
@@ -142,6 +175,19 @@ public class CapabilityBuiltinToolChrome implements CapabilityBuiltinToolSpi {
         String action = cec.getAction();
 
         log.debug("Chrome command: {} (sessionId={})", action, cec.getSessionId());
+
+        // executeJS 只读闸：命中导航写操作 → 直接失败且**不构造命令**
+        // （浏览器命令的唯一出口是 buildCommand，故此处拦截即全网生效）。
+        if (ACTION_EXECUTE_JS.equals(action)) {
+            String hit = matchNavigationWrite(cec.getCode());
+            if (hit != null) {
+                log.warn("Blocked executeJS navigation write: sessionId={} pattern={}",
+                        cec.getSessionId(), hit);
+                return failed("executeJS 仅允许只读操作，检测到导航写操作（命中模式 " + hit
+                                + "）。打开/返回详情请用 click + 平台控件，整页跳转请用 navigate",
+                        ERROR_CATEGORY_JS_NAVIGATION_BLOCKED, cec.getFrameId());
+            }
+        }
 
         // 帧语义：frameId 仅支持 0（主框架）或留空（全部广播）；其他 frame 不可用（AGENT 实测 1/2/3 报错）
         if (cec.getFrameId() != null && cec.getFrameId() > 0) {
@@ -330,10 +376,26 @@ public class CapabilityBuiltinToolChrome implements CapabilityBuiltinToolSpi {
         return vo;
     }
 
+    /**
+     * 检测 executeJS 代码里是否含导航写操作。
+     *
+     * @return 命中的模式字符串（便于告知 agent 具体改哪一处）；未命中返回 {@code null}
+     */
+    static String matchNavigationWrite(String code) {
+        if (code == null || code.isBlank()) {
+            return null;
+        }
+        for (Pattern p : JS_NAVIGATION_WRITE_PATTERNS) {
+            if (p.matcher(code).find()) {
+                return p.pattern();
+            }
+        }
+        return null;
+    }
+
     private ChromeResultVO failed(String message) {
         return failed(message, ERROR_CATEGORY_UNKNOWN, null);
     }
-
     private ChromeResultVO failed(String message, String category, Integer frameId) {
         ChromeResultVO vo = ChromeResultVO.fail(message);
         vo.setErrorCategory(category);

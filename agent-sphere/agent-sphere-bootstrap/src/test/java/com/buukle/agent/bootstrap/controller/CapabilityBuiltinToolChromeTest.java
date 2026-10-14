@@ -69,6 +69,63 @@ class CapabilityBuiltinToolChromeTest {
         return cb;
     }
 
+    private ChromeExecuteContext execJs(String code) {
+        ChromeExecuteContext cec = exec("executeJS", null);
+        cec.setCode(code);
+        return cec;
+    }
+
+    /**
+     * executeJS 只读闸：所有导航写操作必须在**工具层**被拒，且**不发命令**。
+     *
+     * <p>这是线上风控的直接对策 —— 脚本式跳转（尤其 location.href 与 history.back）
+     * 绕过真实点击链路，是猎聘判异常触发 safe.liepin.com 验证码的主因。
+     */
+    @Test
+    void executeJs_navigationWrites_allBlockedWithoutPublish() {
+        String[] codes = {
+                "location.href='https://h.liepin.com/resume/showresumedetail/?res_id_encode=X'",
+                "location['href']='https://h.liepin.com/x'",
+                "location.assign('https://h.liepin.com/x')",
+                "location.replace('https://h.liepin.com/x')",
+                "location.reload()",
+                "document.location='https://h.liepin.com/x'",
+                "window.location.href='https://h.liepin.com/x'",
+                "top.location='https://h.liepin.com/x'",
+                "history.back()",
+                "history.pushState({}, '', '/x')",
+                "window.open('https://h.liepin.com/x')",
+                "document.forms[0].submit()",
+                "location.hash = '#a'",
+        };
+        for (String code : codes) {
+            ChromeResultVO vo = (ChromeResultVO) tool.execute(execJs(code));
+            assertFalse(vo.isSuccess(), "应被拒: " + code);
+            assertEquals("js_navigation_blocked", vo.getErrorCategory(), "错误类别: " + code);
+        }
+        // 一律不发生命令下发（浏览器命令唯一出口是 buildCommand）
+        verify(publisher, never()).publishEvent(any(ChromeCommandDTO.class));
+    }
+
+    /** 只读代码必须放行 —— 不能把正常的读取（含读 location 属性、或 == 比较）误判为导航写。 */
+    @Test
+    void executeJs_readOnly_allowed() {
+        String[] okCodes = {
+                "return document.title",
+                "return document.querySelectorAll('.detail-resume-card-wrap').length",
+                "const p = location.pathname; return p",
+                "return location.href === 'x'",
+                "return document.querySelector('a[href*=detail]')?.getAttribute('href') || ''",
+        };
+        for (String code : okCodes) {
+            callbacks.add(ChromeCallbackDTO.ok("cmd", "ok"));
+            ChromeResultVO vo = (ChromeResultVO) tool.execute(execJs(code));
+            assertTrue(vo.isSuccess(), "应放行: " + code);
+        }
+        verify(publisher, org.mockito.Mockito.times(okCodes.length))
+                .publishEvent(any(ChromeCommandDTO.class));
+    }
+
     @Test
     void repeatedSameFailure_guardAfterTwo() {
         for (int i = 0; i < 2; i++) {

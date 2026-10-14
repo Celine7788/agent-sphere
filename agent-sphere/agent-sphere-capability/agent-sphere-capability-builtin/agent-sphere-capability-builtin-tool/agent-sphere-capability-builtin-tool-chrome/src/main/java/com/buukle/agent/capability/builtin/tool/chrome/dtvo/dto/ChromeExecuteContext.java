@@ -25,7 +25,11 @@ public class ChromeExecuteContext extends ExecuteContext {
     @Schema(example = "北京")
     private String text;
 
-    @Schema(example = "document.title")
+    @Schema(example = "document.title",
+            description = "仅 action=executeJS 时使用。只读：读取 DOM/取值/计算并 return 小 JSON。"
+                    + "禁止导航写操作（location.*= / location.assign|replace|reload / document|window.location / "
+                    + "history.pushState|replaceState|go|back|forward / window.open / form.submit）——会被拒绝并返回 "
+                    + "errorCategory=js_navigation_blocked；打开或返回详情请用 click。")
     private String code;
 
     @Schema(example = "summary", description = "getContent的扫描模式：summary（结构化摘要，含inputs/buttons/forms/navLinks/sections/dialogs）或留空（完整DOM）")

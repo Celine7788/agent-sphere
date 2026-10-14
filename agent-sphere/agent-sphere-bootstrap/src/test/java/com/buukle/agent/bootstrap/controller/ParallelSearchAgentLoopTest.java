@@ -307,7 +307,7 @@ class ParallelSearchAgentLoopTest {
                     new RouteListBuilder(mock(RouteSpi.class), mock(InstanceSpi.class), model),
                     new FallbackRouteExecutor(), mock(HistoryLoader.class), mock(CompactionService.class), input,
                     new RunPromptBuilder(), executor, mock(TitleService.class), mock(AgentToolCallRecordSpi.class),
-                    redis, mock(ChatAttachmentResolver.class), new LlmRequestConfigurer(mock(SystemConfigSpi.class)));
+                    mock(com.buukle.agent.capability.skill.spi.CapabilitySkillSpi.class), redis, mock(ChatAttachmentResolver.class), new LlmRequestConfigurer(mock(SystemConfigSpi.class)));
             runner.run(SESSION_ID);
             if (modelFailure.get() != null) throw new AssertionError("Controlled model validation failed", modelFailure.get());
             assertEquals("COMPLETED", run.getStatus(), "Runner must finish all result-dependent turns");

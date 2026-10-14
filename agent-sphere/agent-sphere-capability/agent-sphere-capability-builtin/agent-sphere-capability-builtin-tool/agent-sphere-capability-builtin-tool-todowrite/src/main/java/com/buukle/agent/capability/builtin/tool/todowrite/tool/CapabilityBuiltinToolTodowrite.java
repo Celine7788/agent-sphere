@@ -22,12 +22,16 @@ public class CapabilityBuiltinToolTodowrite implements CapabilityBuiltinToolSpi 
     static final String STATUS_PENDING = "pending";
     static final String PRIORITY_MEDIUM = "medium";
     static final String TOOL_DESCRIPTION = """
-            Create and maintain a structured task list for the current coding session.
-            Call this tool whenever a task starts, completes, or is cancelled — do NOT
-            treat it as a one-time initialization. Mark a task as in_progress BEFORE
-            working on it (max one at a time). Mark completed ONLY after the work is
-            done AND verified. If blocked, keep it in_progress and add a follow-up
-            todo. Call again whenever any task status changes.""";
+            Create and maintain a structured task list for the current task.
+            If a skill drives this task, its steps are already the plan (and may be
+            pre-seeded into this list) — do NOT build a second list; just update statuses.
+            Otherwise call this tool at the start to lay out the work.
+            Call it again whenever a task's status changes (pending → in_progress →
+            completed / cancelled). Mark a task in_progress BEFORE working on it (max one
+            at a time), and completed ONLY after the work is done AND verified. If blocked,
+            keep it in_progress and add a follow-up todo.
+            NOTE: a completed list is PROGRESS ONLY — it does not by itself finish the task;
+            completion follows the task instructions / the skill's closing conditions.""";
 
     @Override
     public BuiltinToolEnum getToolType() {

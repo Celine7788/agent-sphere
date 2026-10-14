@@ -17,6 +17,16 @@
 // 15s 是极宽松的兜底。executeJS 走 evaluate() 时单独传更大的值。
 const CDP_OP_TIMEOUT_MS = 15000;
 
+// ---- 拟人化参数（技术侧；业务节奏由 skill 定义，这里只做"真实输入"与硬地板）----
+// 点击落点在元素坐标上的随机偏移（像素）。刻意取小值：足够避免"像素级正中"，
+// 又不至于点空（按钮/卡片通常 ≥20px）；点空会由 changed/_clickable 反馈暴露。
+const CLICK_JITTER_PX = 2;
+// 向量轨迹的步数与每步间隔：约 8 步 × 8~22ms ≈ 100~180ms，肉眼是"移过去"而非瞬移。
+const TRAJECTORY_STEPS = 8;
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const randInt = (min, max) => min + Math.floor(Math.random() * (max - min + 1));
+
 export class CdpClient {
   constructor() {
     this.sessions = new Map();
@@ -235,18 +245,53 @@ export class CdpClient {
     }
   }
 
+  /**
+   * 受信鼠标移动轨迹（CDP mouseMoved 多点）。
+   *
+   * <p>真实用户的鼠标是"移过去"的，会先产生一串 mouseMoved 才按下。早先的实现只发
+   * press/release，**没有任何 mouseMoved** —— 这是最典型的自动化指纹之一。
+   * 这里用 easeOutCubic 逼近 + 中间点抖动，最后一步精确落到目标点。
+   */
+  async _moveMouse(tabId, fromX, fromY, toX, toY, steps = TRAJECTORY_STEPS) {
+    for (let i = 1; i <= steps; i++) {
+      const t = i / steps;
+      const e = 1 - Math.pow(1 - t, 3); // easeOutCubic
+      const last = i === steps;
+      const jx = last ? 0 : (Math.random() - 0.5) * 2.5;
+      const jy = last ? 0 : (Math.random() - 0.5) * 2.5;
+      await this.sendCommand(tabId, 'Input.dispatchMouseEvent', {
+        type: 'mouseMoved',
+        x: Math.round(fromX + (toX - fromX) * e + jx),
+        y: Math.round(fromY + (toY - fromY) * e + jy),
+        button: 'none',
+        clickCount: 0,
+      });
+      await sleep(randInt(8, 22));
+    }
+  }
+
   /** 受信鼠标点击（CDP Input）：合成事件在严格 SPA 下常不触发
    *  Vue/React 处理器；Input.dispatchMouseEvent 走真实输入管线（isTrusted=true）。
-   *  x/y 为主 frame 视口 CSS 像素（见 content-locator 的 mainFramePoint）。 */
+   *  x/y 为主 frame 视口 CSS 像素（见 content-locator 的 mainFramePoint）。
+   *
+   *  <p>拟人化：先走一段 mouseMoved 轨迹 → 落点加随机偏移 → press/release 之间随机延迟。
+   *  这些都不改变"可信输入"的本质，只是补上真实鼠标本就会产生的事件序列。 */
   async nativeClick(tabId, x, y) {
     return this._serialized(async () => {
       try {
         await this.attach(tabId);
+        const tx = Math.max(0, x + randInt(-CLICK_JITTER_PX, CLICK_JITTER_PX));
+        const ty = Math.max(0, y + randInt(-CLICK_JITTER_PX, CLICK_JITTER_PX));
+        // 起点在目标附近（模拟"从旁边的上一次位置移过来"），无需额外查询视口尺寸
+        const sx = Math.max(0, tx + randInt(-120, 120));
+        const sy = Math.max(0, ty + randInt(-90, 90));
+        await this._moveMouse(tabId, sx, sy, tx, ty);
         await this.sendCommand(tabId, 'Input.dispatchMouseEvent', {
-          type: 'mousePressed', x, y, button: 'left', clickCount: 1,
+          type: 'mousePressed', x: tx, y: ty, button: 'left', clickCount: 1,
         });
+        await sleep(randInt(35, 120)); // 真实按键有按压时长，不是 0ms
         await this.sendCommand(tabId, 'Input.dispatchMouseEvent', {
-          type: 'mouseReleased', x, y, button: 'left', clickCount: 1,
+          type: 'mouseReleased', x: tx, y: ty, button: 'left', clickCount: 1,
         });
       } catch (e) {
         this._retryDetachOnce(tabId, e, () => this.nativeClick(tabId, x, y));
@@ -273,7 +318,33 @@ export class CdpClient {
     });
   }
 
-  /** 受信文本输入（CDP Input.insertText）：触发输入框自身事件，trusted（含 IME/中文）。 */
+  /** 受信文本输入（CDP Input.insertText）：触发输入框自身事件，trusted（含 IME/中文）。
+   *
+   *  <p>逐字输入：真实用户是一个字一个字敲的，"一次性插入整段"是机械指纹。
+   *  对 CJK 同样有效（insertText 走真实输入管线）。为避免长文本超出 type 的 10s 超时，
+   *  按总预算（默认 3.5s）自适应每字间隔，并加 ±30% 抖动。 */
+  async typeText(tabId, text, opts = {}) {
+    const s = text == null ? '' : String(text);
+    const chars = Array.from(s); // 正确处理代理对 / CJK
+    const budgetMs = opts.budgetMs || 3500;
+    const perChar = chars.length > 0
+      ? Math.max(12, Math.min(90, Math.floor(budgetMs / chars.length)))
+      : 0;
+    return this._serialized(async () => {
+      try {
+        await this.attach(tabId);
+        for (const ch of chars) {
+          await this.sendCommand(tabId, 'Input.insertText', { text: ch });
+          const jitter = perChar * (0.7 + Math.random() * 0.6);
+          await sleep(Math.round(jitter));
+        }
+      } catch (e) {
+        this._retryDetachOnce(tabId, e, () => this.typeText(tabId, text, opts));
+      }
+    });
+  }
+
+  /** 受信文本输入（整段一次性）。保留给"逐字"不适用/过慢的场景与既有调用方。 */
   async insertText(tabId, text) {
     return this._serialized(async () => {
       try {
@@ -313,16 +384,66 @@ export class CdpClient {
     });
   }
 
-  /** 受信悬停（CDP mouseMoved）：触发 hover 面板。 */
+  /** 受信悬停（CDP mouseMoved）：触发 hover 面板。
+   *  拟人化：悬停前先走一小段轨迹，避免"指针凭空出现在目标上"。 */
   async nativeHover(tabId, x, y) {
     return this._serialized(async () => {
       try {
         await this.attach(tabId);
-        await this.sendCommand(tabId, 'Input.dispatchMouseEvent', {
-          type: 'mouseMoved', x, y, button: 'none', clickCount: 0,
-        });
+        const sx = Math.max(0, x + randInt(-80, 80));
+        const sy = Math.max(0, y + randInt(-60, 60));
+        await this._moveMouse(tabId, sx, sy, x, y, 6);
       } catch (e) {
         this._retryDetachOnce(tabId, e, () => this.nativeHover(tabId, x, y));
+      }
+    });
+  }
+
+  /** 视口尺寸（CSS 像素）；取不到时返回 {}，由调用方兜底。 */
+  async _viewportSize(tabId) {
+    try {
+      const { result } = await this.sendCommand(tabId, 'Runtime.evaluate', {
+        expression: '({w: window.innerWidth, h: window.innerHeight})',
+        returnByValue: true,
+      });
+      return (result && result.value) || {};
+    } catch {
+      return {};
+    }
+  }
+
+  /**
+   * 页面级滚动：CDP `Input.dispatchMouseEvent{type:'mouseWheel'}`，**分段 + 随机停顿**。
+   *
+   * <p>替代内容脚本的 `window.scrollBy`：后者是"脚本把页面挪了"，**不产生任何滚动事件**——
+   * "位置变了却收不到 wheel 事件"本身就是一个自动化信号。这里发出真实（isTrusted）滚轮事件，
+   * 由 Chrome 自己滚动，并像真人那样一段一段滚。
+   */
+  async scrollPage(tabId, direction, amount) {
+    const dir = direction || 'down';
+    const vertical = dir !== 'left' && dir !== 'right';
+    const sign = (dir === 'up' || dir === 'left') ? -1 : 1;
+    return this._serialized(async () => {
+      try {
+        await this.attach(tabId);
+        const size = await this._viewportSize(tabId);
+        const cx = Math.round((size.w || 800) / 2);
+        const cy = Math.round((size.h || 600) / 2);
+        const total = amount || Math.max(Math.round((size.h || 600) * 0.8), 200);
+        const segments = Math.max(2, Math.min(6, Math.round(total / 220)));
+        const per = Math.round(total / segments);
+        for (let i = 0; i < segments; i++) {
+          await this.sendCommand(tabId, 'Input.dispatchMouseEvent', {
+            type: 'mouseWheel',
+            x: cx,
+            y: cy,
+            deltaX: vertical ? 0 : sign * per,
+            deltaY: vertical ? sign * per : 0,
+          });
+          await sleep(randInt(60, 180)); // 段间随机停顿
+        }
+      } catch (e) {
+        this._retryDetachOnce(tabId, e, () => this.scrollPage(tabId, direction, amount));
       }
     });
   }
