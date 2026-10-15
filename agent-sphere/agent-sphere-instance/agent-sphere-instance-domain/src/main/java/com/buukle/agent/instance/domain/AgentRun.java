@@ -24,6 +24,11 @@ public class AgentRun {
     private Boolean loopCapped;
     /** 已消耗的 agent 循环轮次；跨挂起恢复递增，使 maxLoopCount 真正成为 per-run 预算。 */
     private Integer loopCount;
+    /**
+     * 失败原因（V87 起）。此前 run 挂了不留任何原因，事件里的 errorMessage 被丢弃、
+     * 表上又没有对应列，导致「为什么失败」事后完全无法回答。
+     */
+    private String errorMessage;
     @TableLogic
     private Boolean deleteFlag;
     private Long tenantId;

@@ -30,6 +30,10 @@ public class RunVO implements Serializable {
      * 模型可反复挂起无限续命。落库后恢复时读回，循环预算才真正是 per-run。
      */
     private Integer loopCount;
+    /**
+     * 失败原因（V87 起）。此前 run 失败不留任何原因，只能靠间接特征反推。
+     */
+    private String errorMessage;
     private String delivery;
     private String createdBy;
     private String createdAt;

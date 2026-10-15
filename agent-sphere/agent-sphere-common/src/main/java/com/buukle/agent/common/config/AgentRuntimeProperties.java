@@ -53,8 +53,15 @@ public class AgentRuntimeProperties {
         /** 单 run 推理落库长度上限（数据完整兜底，默认 50 万字符）。 */
         private int maxReasoningChars = 500000;
         private Duration turnTimeout = Duration.ofSeconds(180);
-        /** 单轮 LLM 失败（非取消）时在同轮内重试次数，降低长任务被瞬时抖动中断的概率。 */
-        private int llmTurnMaxRetries = 1;
+        /**
+         * 单轮 LLM 失败（非取消）时在同轮内重试次数（退避见
+         * {@code RunnerConstants.LLM_TURN_RETRY_BASE_MS}，指数递增）。
+         *
+         * <p>默认 3 而非 1：模型端会突发性连续秒回错误，实测有 run 在 9 秒内连撞 3 次就耗尽
+         * 了 2 次尝试的预算而 FAILED，只有一个恰好只撞 2 次的活了下来。合计 4 次尝试可覆盖
+         * 大多数抖动窗口。
+         */
+        private int llmTurnMaxRetries = 3;
         private CompactionConfig compaction = new CompactionConfig();
 
         @Data

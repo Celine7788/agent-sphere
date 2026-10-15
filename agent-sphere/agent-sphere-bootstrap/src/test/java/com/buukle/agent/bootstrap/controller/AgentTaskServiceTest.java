@@ -523,6 +523,12 @@ class AgentTaskServiceTest {
         ArgumentCaptor<AgentTask> taskCaptor = ArgumentCaptor.forClass(AgentTask.class);
         verify(taskCallbackService).notifyTerminal(taskCaptor.capture());
         assertEquals("FAILED", taskCaptor.getValue().getStatus());
-        org.junit.jupiter.api.Assertions.assertTrue(taskCaptor.getValue().getResultJson().contains("loop limit"));
+        // resultJson 必须带上 run 的实际产出，而不是只回一句无关的错误串 ——
+        // 线上 task 360/362 就是只收到 {"error":"run loop limit reached"}，
+        // 模型写的结构化结论被整个丢弃。失败原因改由 remark 承载。
+        org.junit.jupiter.api.Assertions.assertTrue(taskCaptor.getValue().getResultJson().contains("部分结果"),
+                "loop cap 失败也必须让业务方看到 run 产出");
+        org.junit.jupiter.api.Assertions.assertNotNull(taskCaptor.getValue().getRemark(),
+                "失败原因要写进 remark（此前线上全部为空串）");
     }
 }

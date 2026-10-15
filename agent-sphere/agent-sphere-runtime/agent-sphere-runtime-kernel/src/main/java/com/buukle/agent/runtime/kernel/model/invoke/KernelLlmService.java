@@ -46,6 +46,15 @@ public class KernelLlmService {
             StringBuilder textCollector = new StringBuilder();
             StringBuilder reasoningCollector = new StringBuilder();
             AtomicReference<Map<String, Object>> usageRef = new AtomicReference<>();
+            /**
+             * 供应商以 <b>事件</b>（而非异常）回报的错误。
+             *
+             * <p>它不经过下面的 catch，所以 {@code success}/{@code errorMessage} 永远是默认值 ——
+             * 结果是「直接把 run 打挂」的那类失败在 {@code agent_llm_interaction_record} 里
+             * 全记成 {@code success=true, error_message=NULL}，事后完全无法审计。
+             * 用 AtomicReference 持有是因为内层 stream consumer 无法直接改外层局部变量。
+             */
+            AtomicReference<String> errorEventRef = new AtomicReference<>();
             String requestBody = JsonUtils.toJson(request);
             try {
                 CountDownLatch done = new CountDownLatch(1);
@@ -67,6 +76,10 @@ public class KernelLlmService {
                                         reasoningCollector.append(clean);
                                         resultCollector.append(clean); // response_body 保持兼容（合并）
                                         onEvent.accept(new LLMEvent.ReasoningDelta(clean));
+                                    } else if (event instanceof LLMEvent.Error(String message)) {
+                                        // 先记账再转发：转发后调用方可能立刻终止本次调用
+                                        errorEventRef.compareAndSet(null, message);
+                                        onEvent.accept(event);
                                     } else if (event instanceof LLMEvent.Finish(String reason, Map<String, Object> usage) && usage != null) {
                                         usageRef.set(usage);
                                         onEvent.accept(event);
@@ -96,12 +109,16 @@ public class KernelLlmService {
                 errorMessage = e.getMessage();
                 future.completeExceptionally(e instanceof RuntimeException re ? re : new RuntimeException(e));
             } finally {
+                // 事件错误与异常错误合并成同一条失败记录：只要有任一路径报错，这次调用就没成功
+                String eventError = errorEventRef.get();
+                boolean failed = !success || eventError != null;
+                String finalError = errorMessage != null ? errorMessage : eventError;
                 eventPublisher.publishEvent(new LlmInteractionEvent(
                         this, meta, modelName, requestBody, resultCollector.toString(),
                         textCollector.length() > 0 ? textCollector.toString() : null,
                         reasoningCollector.length() > 0 ? reasoningCollector.toString() : null,
                         TokenUsage.from(usageRef.get()),
-                        System.currentTimeMillis() - start, success, errorMessage));
+                        System.currentTimeMillis() - start, !failed, finalError));
             }
         });
 

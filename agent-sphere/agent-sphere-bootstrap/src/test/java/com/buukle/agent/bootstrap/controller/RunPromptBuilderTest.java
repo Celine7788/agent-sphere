@@ -102,4 +102,36 @@ class RunPromptBuilderTest {
                 names,
                 "工具定义应按名称稳定排序，避免遍历顺序变动破坏缓存前缀");
     }
+
+    @Test
+    void buildLoopBudget_reportsCurrentLoopAndRemainingIncludingThisOne() {
+        String text = builder.buildLoopBudget(5, 123, 128);
+
+        assertTrue(text.startsWith(RunnerConstants.LOOP_BUDGET_PREFIX), "预算段以 marker 开头（供跨轮定位并清除）");
+        assertTrue(text.contains("5/128"), "应报出当前轮序号与生效上限");
+        assertTrue(text.contains("123"), "应报出剩余轮数");
+        assertTrue(builder.isLoopBudget(text), "marker 应能被 isLoopBudget 识别");
+        assertFalse(builder.isLoopBudget("plain system text"));
+        assertFalse(builder.isLoopBudget(null));
+        assertFalse(builder.isLoopBudget(RunnerConstants.FINAL_TURN_INSTRUCTION),
+                "硬收口指令不是预算段，否则会被当作预算一起清掉");
+    }
+
+    @Test
+    void buildLoopBudget_neverReportsZeroRemaining() {
+        // 最后一轮：remaining = 1（含本轮）。出现「剩 0 轮」会让模型以为自己已无路可走而放弃收尾
+        String last = builder.buildLoopBudget(128, 1, 128);
+
+        assertTrue(last.contains("1 turn(s) remaining"), "末轮应报 1 轮而非 0 轮");
+        assertFalse(last.contains("0 turn(s) remaining"));
+    }
+
+    @Test
+    void buildLoopBudget_addsUrgencyOnlyWhenCloseToLimit() {
+        String plenty = builder.buildLoopBudget(3, 125, 128);
+        String close = builder.buildLoopBudget(124, RunnerConstants.LOOP_BUDGET_LOW_THRESHOLD, 128);
+
+        assertFalse(plenty.contains("converge"), "轮数充裕时不该催促，避免模型过早收口");
+        assertTrue(close.contains("converge"), "逼近上限应显式催促收口，否则会被 loop cap 截成半成品");
+    }
 }

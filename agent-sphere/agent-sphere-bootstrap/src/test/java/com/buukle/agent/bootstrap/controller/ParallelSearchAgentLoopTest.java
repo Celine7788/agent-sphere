@@ -332,10 +332,20 @@ class ParallelSearchAgentLoopTest {
 
     private static String toolResult(ChatCompletionRequestDTO request, String callId, String toolName) throws Exception {
         List<ChatMessageDTO> messages = request.getMessages();
-        ChatMessageDTO tool = messages.getLast();
+        // 找最后一条 tool 结果而不是取 getLast()：尾部还会挂 loop 预算预告（system 段）。
+        // 真正要守的不变式是「assistant(tool_calls) 紧跟其 tool 结果」，与尾部挂什么无关。
+        int toolIdx = -1;
+        for (int i = messages.size() - 1; i >= 0; i--) {
+            if ("tool".equals(messages.get(i).getRole())) {
+                toolIdx = i;
+                break;
+            }
+        }
+        assertTrue(toolIdx >= 0, "No tool result message in request");
+        ChatMessageDTO tool = messages.get(toolIdx);
         assertEquals("tool", tool.getRole());
         assertEquals(callId, tool.getToolCallId());
-        ChatMessageDTO assistant = messages.get(messages.size() - 2);
+        ChatMessageDTO assistant = messages.get(toolIdx - 1);
         assertEquals("assistant", assistant.getRole());
         assertEquals(callId, assistant.getToolCalls().getFirst().getId());
         assertEquals(toolName, assistant.getToolCalls().getFirst().getFunction().getName());

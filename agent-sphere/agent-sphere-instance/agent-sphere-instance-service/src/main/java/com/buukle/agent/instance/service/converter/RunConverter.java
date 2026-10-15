@@ -26,6 +26,7 @@ public class RunConverter {
         vo.setStatus(run.getStatus());
         vo.setLoopCapped(run.getLoopCapped());
         vo.setLoopCount(run.getLoopCount());
+        vo.setErrorMessage(run.getErrorMessage());
         vo.setCreatedBy(run.getCreatedBy());
         vo.setCreatedAt(run.getCreatedAt() != null ? run.getCreatedAt().toString() : null);
         return vo;
@@ -56,6 +57,7 @@ public class RunConverter {
         run.setStatus(vo.getStatus());
         run.setLoopCapped(vo.getLoopCapped());
         run.setLoopCount(vo.getLoopCount());
+        run.setErrorMessage(vo.getErrorMessage());
         return run;
     }
 

@@ -262,17 +262,11 @@ public class SessionRunner {
             List<RuntimeTool> tools = ctx != null ? ctx.getTools() : List.of();
             List<ToolDefinitionDTO> toolDefs = runPromptBuilder.buildToolDefinitions(tools);
 
-            // 最后一轮：收口指令以尾部 system 消息追加（不修改 index 0，保持 messages[0]+历史前缀字节稳定以命中缓存）
+            // 尾部预告块：每轮的 loop 预算 + 临近上限时的硬收口。
+            // isLastLoop 仍按 n-1 判定 —— 它是 loop cap 的执行时机（见下方工具轮收口），
+            // 硬收口则提前 FINAL_TURN_INSTRUCTION_LEAD 轮，两者刻意不同。
             boolean isLastLoop = loopCount >= maxLoopCount - 1;
-            if (isLastLoop && !messages.isEmpty()) {
-                ChatMessageDTO tail = messages.get(messages.size() - 1);
-                String tailText = tail.getContent() instanceof String s ? s : null;
-                if (!RunnerConstants.FINAL_TURN_INSTRUCTION.equals(tailText)) {
-                    messages.add(new ChatMessageDTO()
-                            .setRole(LlmApiConstant.ROLE_SYSTEM)
-                            .setContent(RunnerConstants.FINAL_TURN_INSTRUCTION));
-                }
-            }
+            applyLoopBudget(messages, loopCount, maxLoopCount);
 
             AtomicReference<String> turnReasoningRef = new AtomicReference<>("");
             TurnResult turn = runTurn(sessionId, currentRunId, messages, toolDefs, tools, ctx, turnReasoningRef);
@@ -330,9 +324,13 @@ public class SessionRunner {
                     break loop;
                 }
                 case COMPLETE -> {
-                    if (isLastLoop) {
-                        markLoopCapped(currentRun, maxLoopCount);
-                    }
+                    // 注意：这里<b>不能</b>置 loopCapped。走到本分支说明模型在最后一轮主动交付了答案，
+                    // 那是一次正常完成，不是被上限截断。旧实现在此也置 loopCapped，导致
+                    // 「恰好在最后一轮收工」与「被截断出半成品」被混为一谈；任务守卫
+                    // (AgentTaskServiceImpl) 据此一票否决，把这份完整产出整个丢掉
+                    // ——线上 run 1575（status=empty/stopReason=POOL_EXHAUSTED，池子跑完的完整结论）
+                    // 就是这样被回成 {"error":"run loop limit reached"} 的。
+                    // 真截断只在下面的工具轮分支标记。
                     String reply = allContent.length() > 0
                             ? allContent.toString()
                             : turnReasoningRef.get();
@@ -608,15 +606,63 @@ public class SessionRunner {
             messages.get(existingSlot).setContent(suffix);
             return;
         }
-        // 无已有槽：优先插在 FINAL_TURN 收口指令之前，保证待办是"最末可见 system"之一
-        int insertAt = messages.size();
-        Object last = messages.get(messages.size() - 1).getContent();
-        if (last instanceof String s && RunnerConstants.FINAL_TURN_INSTRUCTION.equals(s)) {
-            insertAt = messages.size() - 1;
-        }
+        // 无已有槽：优先插在尾部预告块之前，保证待办是"最末可见 system"之一
+        int insertAt = tailNoticeBlockStart(messages);
         messages.add(insertAt, new ChatMessageDTO()
                 .setRole(LlmApiConstant.ROLE_SYSTEM)
                 .setContent(suffix));
+    }
+
+    /**
+     * 重建消息列表尾部的预告块：loop 预算预告（每轮都有）+ 硬收口（剩余 ≤
+     * {@link RunnerConstants#FINAL_TURN_INSTRUCTION_LEAD} 轮时起，每轮都带）。
+     *
+     * <p>每轮重建而不是原位替换：工具轮会往 messages 尾部追加 assistant(tool_calls)/tool/观察消息，
+     * 上一轮的预算副本会被挤进历史中间，既白烧 context 又与新文案矛盾。清除用 marker
+     * 全表扫描，保证全列表恒只有一份当前轮次的预算。
+     *
+     * <p>硬收口从 n-{@code LEAD} 起注入而非等到最后一轮：收口只是提示、不强制，而模型常常正好
+     * 在最后一轮才收工，只给 1 轮收尾太紧（详见 {@link RunnerConstants#FINAL_TURN_INSTRUCTION_LEAD}）。
+     * 它是<b>持续</b>注入的 —— 一旦进入该窗口，n-2、n-1 同样携带，直到本方法每轮重建时重新判定。
+     */
+    private void applyLoopBudget(List<ChatMessageDTO> messages, int loopCount, int maxLoopCount) {
+        if (messages == null || messages.isEmpty()) {
+            return;
+        }
+        messages.removeIf(m -> {
+            Object content = m.getContent();
+            if (!(content instanceof String s)) {
+                return false;
+            }
+            return runPromptBuilder.isLoopBudget(s) || RunnerConstants.FINAL_TURN_INSTRUCTION.equals(s);
+        });
+        int remaining = maxLoopCount - loopCount;
+        messages.add(new ChatMessageDTO()
+                .setRole(LlmApiConstant.ROLE_SYSTEM)
+                .setContent(runPromptBuilder.buildLoopBudget(
+                        loopCount + 1, remaining, maxLoopCount)));
+        if (remaining <= RunnerConstants.FINAL_TURN_INSTRUCTION_LEAD) {
+            messages.add(new ChatMessageDTO()
+                    .setRole(LlmApiConstant.ROLE_SYSTEM)
+                    .setContent(RunnerConstants.FINAL_TURN_INSTRUCTION));
+        }
+    }
+
+    /**
+     * 尾部预告块（loop 预算 / 终轮收口）的起始下标；没有则返回列表长度（即末尾）。
+     * 待办槽插在它前面，避免轮中刷新待办后被预告挤到中间、失去「最末可见 system」的效力。
+     */
+    private int tailNoticeBlockStart(List<ChatMessageDTO> messages) {
+        for (int i = 0; i < messages.size(); i++) {
+            Object content = messages.get(i).getContent();
+            if (!(content instanceof String s)) {
+                continue;
+            }
+            if (runPromptBuilder.isLoopBudget(s) || RunnerConstants.FINAL_TURN_INSTRUCTION.equals(s)) {
+                return i;
+            }
+        }
+        return messages.size();
     }
 
     /**
@@ -679,9 +725,11 @@ public class SessionRunner {
         AtomicReference<String> turnReasoningOut = turnReasoning;
         for (int attempt = 0; attempt <= turnRetries; attempt++) {
             if (attempt > 0) {
-                log.warn("LLM turn failed transiently, retrying {}/{}: session={}", attempt, turnRetries, sessionId);
+                long backoffMs = llmTurnRetryBackoffMs(attempt);
+                log.warn("LLM turn failed transiently, retrying {}/{} in {}ms: session={}",
+                        attempt, turnRetries, backoffMs, sessionId);
                 try {
-                    Thread.sleep(1000);
+                    Thread.sleep(backoffMs);
                 } catch (InterruptedException ie) {
                     Thread.currentThread().interrupt();
                     return TurnResult.error("LLM turn retry interrupted");
@@ -862,6 +910,22 @@ public class SessionRunner {
 
     private static String getTurnContent(AtomicReference<String> contentRef) {
         return contentRef.get();
+    }
+
+    /**
+     * 第 {@code attempt} 次重试前的等待时长：{@code 基数 × 2^(attempt-1)}，封顶 {@code MAX}。
+     *
+     * <p>1-based attempt：第一次重试等 {@code BASE}，之后 2×/4× 递增。
+     */
+    static long llmTurnRetryBackoffMs(int attempt) {
+        if (attempt <= 0) {
+            return 0L;
+        }
+        long delay = RunnerConstants.LLM_TURN_RETRY_BASE_MS;
+        for (int i = 1; i < attempt; i++) {
+            delay = Math.min(delay * 2, RunnerConstants.LLM_TURN_RETRY_MAX_MS);
+        }
+        return Math.min(delay, RunnerConstants.LLM_TURN_RETRY_MAX_MS);
     }
 
     /**

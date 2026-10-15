@@ -84,6 +84,8 @@ public class AgentTaskServiceImpl implements AgentTaskService {
     private static final String PHASE_EXECUTE = "execute";
     private static final String PHASE_EXTRACT = "extract";
     private static final String PHASE_REFINE = "refine";
+    /** 回给业务方的失败原因（随 callback 的 remark 字段发出）。 */
+    private static final String REASON_LOOP_LIMIT = "任务执行轮次达到上限并在最后一轮被强制截断，模型未能完成收尾";
 
     private final AgentTaskMapper taskMapper;
     private final AgentTaskArtifactMapper artifactMapper;
@@ -496,11 +498,16 @@ public class AgentTaskServiceImpl implements AgentTaskService {
     private boolean handleCompletedPhase(AgentTask task, String phase, Long currentRunId, RunVO run) {
         switch (phase) {
             case PHASE_EXECUTE -> {
-                // 命中循环次数上限被强收口 → 视为执行失败，不再进入提炼阶段
+                // 命中循环次数上限被<b>真截断</b>（最后一轮仍在调工具）→ 视为执行失败，不再进入提炼阶段。
+                // 注意 loopCapped 现在只在 SessionRunner 的工具轮收口分支置位；模型在最后一轮主动
+                // 交付答案（COMPLETE 分支）不再置位，否则会把正常完成误判成半成品而丢掉产出。
                 if (Boolean.TRUE.equals(run.getLoopCapped())) {
                     log.warn("Task {} execute run {} hit loop cap, failing task", task.getId(), currentRunId);
-                    markTerminal(task.getId(), TaskEnum.STATUS_FAILED,
-                            JsonUtils.toJson(Map.of("error", "run loop limit reached")));
+                    // 必须带上 run 的实际产出：run 通常已经写出结构化结论（哪怕是
+                    // status=INCOMPLETE 的自陈中断），只回 {"error": ...} 会让业务方完全看不到
+                    // 模型干了什么、卡在哪一步 —— 线上 task 360/362 就是这样只收到一句无关错误串。
+                    markTerminalWithRemark(task.getId(), TaskEnum.STATUS_FAILED,
+                            replyJson(run), REASON_LOOP_LIMIT);
                     return true;
                 }
                 // 无契约（未配置 expectedOutput）→ 保持原有行为直接收尾
@@ -653,6 +660,33 @@ public class AgentTaskServiceImpl implements AgentTaskService {
         transitionToTerminal(task, status, resultJson);
     }
 
+    /**
+     * 终态 + 人话原因。{@code remark} 会随回调发给业务方（{@code TaskCallbackBody.remark}），
+     * 此前线上 153 个任务的 remark 全为空，业务方收不到任何可读的失败说明。
+     */
+    private void markTerminalWithRemark(Long taskId, String status, String resultJson, String remark) {
+        AgentTask task = taskMapper.selectById(taskId);
+        if (task == null) {
+            return;
+        }
+        if (isTerminal(task.getStatus())) {
+            return;
+        }
+        // 与 transitionToTerminal 同样的「条件更新保证多副本单胜者」语义
+        int updated = taskMapper.update(null, new LambdaUpdateWrapper<AgentTask>()
+                .eq(AgentTask::getId, task.getId())
+                .in(AgentTask::getStatus, TaskEnum.STATUS_RUNNING, TaskEnum.STATUS_QUEUED)
+                .set(AgentTask::getStatus, status)
+                .set(AgentTask::getRemark, remark)
+                .set(AgentTask::getResultJson, resultJson));
+        if (updated > 0) {
+            task.setStatus(status);
+            task.setRemark(remark);
+            task.setResultJson(resultJson);
+            afterTerminal(task);
+        }
+    }
+
     private void transitionToTerminal(AgentTask task, String status, String resultJson) {
         if (isTerminal(task.getStatus())) {
             return;
@@ -666,11 +700,16 @@ public class AgentTaskServiceImpl implements AgentTaskService {
         if (updated > 0) {
             task.setStatus(status);
             task.setResultJson(resultJson);
-            // 任务已终态：凭证没有存在意义了，立刻清理而不是等 TTL。
-            // 放在 notifyTerminal 之前，保证即使回调方超时/异常也已完成清理。
-            taskMcpCredentialStore.evict(task.getSessionId());
-            taskCallbackService.notifyTerminal(task);
+            afterTerminal(task);
         }
+    }
+
+    /** 终态后的收尾：清凭证 + 发回调。由 transitionToTerminal / markTerminalWithRemark 共用。 */
+    private void afterTerminal(AgentTask task) {
+        // 任务已终态：凭证没有存在意义了，立刻清理而不是等 TTL。
+        // 放在 notifyTerminal 之前，保证即使回调方超时/异常也已完成清理。
+        taskMcpCredentialStore.evict(task.getSessionId());
+        taskCallbackService.notifyTerminal(task);
     }
 
     private boolean isTerminal(String status) {

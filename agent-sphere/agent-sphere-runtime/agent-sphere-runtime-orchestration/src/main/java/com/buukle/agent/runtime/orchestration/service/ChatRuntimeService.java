@@ -156,6 +156,7 @@ public class ChatRuntimeService {
     public ResumeOutcome resumeFromWait(PendingWaitVO wait) {
         Long sessionId = wait.getSessionId();
         Long runId = wait.getRunId();
+        boolean submitted = false;
         try {
             RunVO run = runSpi.getRun(runId);
             if (run == null) {
@@ -180,31 +181,50 @@ public class ChatRuntimeService {
                 sessionSpi.touchSession(sessionId);
                 orchestrator.asyncHandleUserMessage(run, sessionId,
                         WaitConstants.WAIT_RESUME_PREFIX + wait.getWaitMs() + "ms elapsed.", null, true, List.of());
+                submitted = true;
             } finally {
                 if (ctx) AuthContext.clear();
             }
 
             // 恢复已提交后才补 wait 那条 tool call 的结果（避免"工具已记成功但 run 没恢复"）。
-            if (wait.getCallId() != null && !wait.getCallId().isBlank()) {
-                String artifact = "{\"status\":\"waiting\",\"elapsed_ms\":" + wait.getWaitMs()
-                        + ",\"resumed_at\":\"" + java.time.LocalDateTime.now() + "\"}";
-                eventPublisher.publishEvent(new RuntimeEventVO(ToolCallStatus.SUCCEEDED,
-                        new RuntimeEventDataVO()
-                                .setSessionId(sessionId)
-                                .setRunId(runId)
-                                .setToolName(WaitConstants.TOOL_NAME)
-                                .setDisplayNameCn(WaitConstants.DISPLAY_NAME_CN)
-                                .setDisplayNameEn(WaitConstants.DISPLAY_NAME)
-                                .setArtifact(artifact)
-                                .setPublishId(RuntimeEventTypeConstant.PUBLISH_ID_TOOL + wait.getCallId())));
-            }
+            // 这只是展示层事件，**绝不能让它有能力让恢复失败** —— 一旦它抛异常而把状态退回
+            // WAITING，异步循环其实已经在跑，等于凭空造出第二个循环（见 rollbackToWaiting）。
+            recordWaitToolSucceeded(wait, sessionId, runId);
             log.info("Wait resumed: waitId={} runId={} sessionId={} waitedMs={}",
                     wait.getId(), runId, sessionId, wait.getWaitMs());
             return ResumeOutcome.RESUMED;
         } catch (Exception e) {
-            log.warn("Wait resume failed: waitId={} runId={}", wait.getId(), runId, e);
-            rollbackToWaiting(runId);
+            log.warn("Wait resume failed: waitId={} runId={} submitted={}", wait.getId(), runId, submitted, e);
+            if (submitted) {
+                // 异步续跑已提交：循环正在跑。此时回退状态会让 wait 记录重回 PENDING、被 cron 再次
+                // claim 并<b>再提交一次</b>，两个循环并发写同一个 run。只能记 ERROR 让调用方重试/终态化。
+                log.warn("Wait resume failed after async submit; not rolling back run {} to avoid duplicate execution", runId);
+            } else {
+                rollbackToWaiting(runId);
+            }
             return ResumeOutcome.ERROR;
+        }
+    }
+
+    /** 补记 wait 那次工具调用的成功结果；失败只告警，不影响恢复结果。 */
+    private void recordWaitToolSucceeded(PendingWaitVO wait, Long sessionId, Long runId) {
+        if (wait.getCallId() == null || wait.getCallId().isBlank()) {
+            return;
+        }
+        try {
+            String artifact = "{\"status\":\"waiting\",\"elapsed_ms\":" + wait.getWaitMs()
+                    + ",\"resumed_at\":\"" + java.time.LocalDateTime.now() + "\"}";
+            eventPublisher.publishEvent(new RuntimeEventVO(ToolCallStatus.SUCCEEDED,
+                    new RuntimeEventDataVO()
+                            .setSessionId(sessionId)
+                            .setRunId(runId)
+                            .setToolName(WaitConstants.TOOL_NAME)
+                            .setDisplayNameCn(WaitConstants.DISPLAY_NAME_CN)
+                            .setDisplayNameEn(WaitConstants.DISPLAY_NAME)
+                            .setArtifact(artifact)
+                            .setPublishId(RuntimeEventTypeConstant.PUBLISH_ID_TOOL + wait.getCallId())));
+        } catch (Exception e) {
+            log.warn("Failed to record wait tool success: waitId={} runId={}", wait.getId(), runId, e);
         }
     }
 

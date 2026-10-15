@@ -94,9 +94,53 @@ public final class RunnerConstants {
     public static final String COMPACTION_ASSISTANT_PREFIX = "Assistant: ";
     public static final String COMPACTION_NEWLINE = "\n";
     public static final String HISTORY_SUMMARY_PREFIX = "[Conversation summary]\n";
-    /** 终态轮收口指令：作为尾部 system 消息追加（不修改 index 0，保持前缀缓存稳定）。 */
+    /**
+     * 硬收口指令的提前量：剩余轮数 ≤ 该值时即注入 {@link #FINAL_TURN_INSTRUCTION}。
+     *
+     * <p>曾是「只在最后一轮（n-1）注入」。但收口指令只是<b>提示</b>、不强制执行，而模型往往
+     * 真的在最后一轮才收工 —— 线上 run 1575/1569 两条都正好落在最后一轮。留给模型 1 轮收尾
+     * 太紧：它要么来不及把结论写完整，要么只能把"被打断"当成交付理由
+     * （run 1569 就是 `status:"INCOMPLETE"`）。提前到 n-3 让它有 3 轮完成收尾与润色。
+     *
+     * <p><b>注意</b>：这不影响 loop cap 的执行时机（仍是 n-1），只是把"该收工了"的信号提前。
+     */
+    public static final int FINAL_TURN_INSTRUCTION_LEAD = 3;
+
+    /**
+     * 终态轮收口指令：作为尾部 system 消息追加（不修改 index 0，保持前缀缓存稳定）。
+     *
+     * <p>措辞用「接近上限 / 剩余轮次有限」而非「这是你的最后一轮」—— 因为它在 n-3 就开始注入，
+     * 说"最后一轮"是假的，模型可能因此误判还剩一次机会而继续调工具。
+     */
     public static final String FINAL_TURN_INSTRUCTION =
-            "\n\n**IMPORTANT: This is your final turn. You MUST provide a complete summary answer now. Do NOT call any more tools.**";
+            "\n\n**IMPORTANT: You are approaching the hard loop limit. From now on you must NOT call any more"
+                    + " tools. Use your remaining turns to deliver a complete, well-structured final answer,"
+                    + " then stop.**";
+
+    /**
+     * 每轮 loop 预算预告的 marker：同时用于「跨轮定位并清除上一轮副本」与文案前缀。
+     *
+     * <p>预算文案每轮都变（当前第几轮 / 还剩几轮），且工具轮会往 messages 尾部追加
+     * assistant/tool/观察消息（SessionRunner#runInternal），所以**不能原位替换** ——
+     * 上一轮的副本会被挤进历史中间，既浪费 context 又会与新文案互相矛盾。
+     * 必须每轮先按本 marker 全部清除再在尾部重新追加，保证全列表恒只有一份。
+     */
+    public static final String LOOP_BUDGET_PREFIX = "\n\n[LOOP BUDGET] ";
+
+    /** 剩余轮数低于该值时，预算预告追加一句紧迫提醒（模型对「还剩 100 轮」无感，需要显式推一把）。 */
+    public static final int LOOP_BUDGET_LOW_THRESHOLD = 5;
+
+    /**
+     * 单轮 LLM 失败后的重试退避基数（毫秒），按 {@code 基数 × 2^(attempt-1)} 递增并封顶。
+     *
+     * <p>曾经是固定 {@code sleep(1000)} + 只有 1 次重试（合计 2 次尝试）。线上实测模型端
+     * 会<b>突发性连续</b>秒回错误：有 run 在 9 秒内连撞 3 次即耗尽重试预算而 FAILED，
+     * 只有一个恰好只撞 2 次的 run 侥幸活下来。固定 1s 退避撞上突发窗口反而会在同一秒
+     * 再打一次，把同一次抖动放大成连续失败。
+     */
+    public static final long LLM_TURN_RETRY_BASE_MS = 1_000L;
+    /** 重试退避上限（毫秒），避免长重试链把单轮拖到不可接受。 */
+    public static final long LLM_TURN_RETRY_MAX_MS = 8_000L;
 
     /** delegate 子 Agent 工作流指引（仅当注册了 delegate 工具时追加，避免无谓 token）。 */
     public static final String PROMPT_SUBAGENT_WORKFLOW = """

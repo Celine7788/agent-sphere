@@ -210,6 +210,13 @@ public class RuntimeEventListener {
             }
             case FAILED -> {
                 run.setStatus(status.value());
+                // 失败原因必须落库（V87）：此前这里只写 status、丢弃事件里的 errorMessage，
+                // 而 run 表又没有对应列 —— run 挂了不留任何原因，事后无法定位。
+                // 所有 FAILED 发布方（SessionRunner 单轮失败 / RuntimeOrchestrator 提交期失败 /
+                // OrphanRunSweeper / failStuckWait）都已把原因放进事件，这里是唯一收口点。
+                if (data.getErrorMessage() != null && !data.getErrorMessage().isBlank()) {
+                    run.setErrorMessage(data.getErrorMessage());
+                }
                 flushReasoning(run);
                 runSpi.updateRun(run);
                 timelineRecorder.closeAssistant(data.getSessionId(), run.getId(), TimelineState.FAILED.getCode());

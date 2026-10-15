@@ -73,4 +73,18 @@ class RunConverterTest {
 
         assertNull(vo.getAttachments());
     }
+
+    @Test
+    void errorMessage_roundTripsBothDirections() {
+        // RunConverter 是手写的，漏掉一个方向不会报错、只会让失败原因静默丢失（V87 的教训）
+        RunVO vo = new RunVO();
+        vo.setId(1L);
+        vo.setErrorMessage("rate limited by upstream");
+
+        AgentRun do_ = converter.toDO(vo);
+        assertEquals("rate limited by upstream", do_.getErrorMessage(), "VO → DO 必须带上失败原因");
+
+        RunVO back = converter.toVO(do_);
+        assertEquals("rate limited by upstream", back.getErrorMessage(), "DO → VO 必须带上失败原因");
+    }
 }

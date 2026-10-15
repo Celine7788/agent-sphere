@@ -73,6 +73,34 @@ public class RunPromptBuilder {
     }
 
     /**
+     * 每轮 loop 预算预告：告诉模型「当前第几轮 / 还剩几轮（含本轮）」。
+     *
+     * <p>{@code current} 与 {@code remaining} 均以 1 起算（remaining = 最后一轮时的 1），
+     * 所以文案里永远不会出现「剩 0 轮」这种自相矛盾的说法。
+     * 剩余轮数逼近上限时追加紧迫提醒 —— 模型对「还剩 100 轮」天然无感，
+     * 不提示就会一直不收口，最后被 loop cap 硬截断成半成品。
+     *
+     * @param current   当前轮序号（1 起算）
+     * @param remaining 剩余轮数（1 起算，含本轮）
+     * @param total     生效的轮次上限（实例/任务/系统配置覆盖后的真实值）
+     */
+    public String buildLoopBudget(int current, int remaining, int total) {
+        String text = RunnerConstants.LOOP_BUDGET_PREFIX
+                + "Loop " + current + "/" + total + ". "
+                + remaining + " turn(s) remaining (including this one).";
+        if (remaining <= RunnerConstants.LOOP_BUDGET_LOW_THRESHOLD) {
+            text += " You are close to the hard loop limit — converge now: finish only"
+                    + " the work that is actually required and stop doing anything optional.";
+        }
+        return text;
+    }
+
+    /** 判断消息是否 loop 预算预告（以 marker 开头，用于跨轮定位并清除上一轮副本）。 */
+    public boolean isLoopBudget(String content) {
+        return content != null && content.startsWith(RunnerConstants.LOOP_BUDGET_PREFIX);
+    }
+
+    /**
      * 当前服务器时间（独立小段文本，供组装侧追加到消息尾部）。
      * 放在 system prompt 头部会破坏前缀缓存，故由调用方追加为最末一条 system 消息，
      * 保证 messages[0] 及历史前缀字节稳定。

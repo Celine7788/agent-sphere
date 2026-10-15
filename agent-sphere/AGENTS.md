@@ -166,6 +166,20 @@ copies from their origin skill. Replaces the old `SkillAutoUpdateSweeper`.
   （澄清现在也有这个洞，V82 一并修掉）。恢复时从 `currentRun.getLoopCount()` 起步；
   自增随循环顶部那次已有的 `updateRun` 一并落库，不额外增加写。
   `RunConverter` 是手写的，**加字段必须两边都改**，漏了不会报错、只会让护栏静默失效。
+- **尾部预告块（loop 预算 + 终轮收口）必须每轮重建，不能原位替换。** 工具轮会往 messages 尾部
+  追加 assistant(tool_calls)/tool/观察消息，预览若只做「原位替换」就会沉进历史中间 —— 既白烧
+  context，又出现两份互相矛盾的「还剩几轮」。所以 `applyLoopBudget` 每轮先按
+  `LOOP_BUDGET_PREFIX` marker **全表 removeIf**（顺带清掉残留的 `FINAL_TURN_INSTRUCTION`，
+  否则上一轮收过口的 run 会被永久禁止调工具），再在尾部重新追加，保证全列表恒只有一份当前轮次。
+  尾部顺序恒为 `[…, todolist?, loopBudget, (FINAL_TURN)]` —— 待办槽插在预告块之前，
+  轮中刷新待办才不会被挤到中间。
+- **倒计时 ≠ 硬收口。** `FINAL_TURN_INSTRUCTION`（"Do NOT call any more tools"）只在**最后一轮**
+  注入；预算预告只是数感（`Loop n/total, remaining m`），剩余 ≤ `LOOP_BUDGET_LOW_THRESHOLD`(5) 才
+  加一句催促。提前几轮就禁工具会把没做完的活截成半成品 —— 这正是把它从「n-1 提前到 n-5」时
+  最容易踩的坑。
+- **`isLastLoop` 必须留在 `maxLoopCount - 1`。** 它不只管注入收口指令，还管 COMPLETE 分支与
+  工具执行后的 `markLoopCapped`（loop cap 的执行时机）。为了调预告而改这个判据，会让
+  loop cap 静默失效。倒计时用 `remaining = maxLoopCount - loopCount` 单独算，不复用它。
 - **子 Agent 工具集必须剔除 `wait`**（`SessionSubRunner#filterTools`）。挂起判定只在主循环有；
   放行的话 `ToolExecutor` 仍会建 pending 记录并返回 `{"status":"waiting"}`，却没人认领 ——
   变成一次静默的空等。
@@ -230,6 +244,67 @@ copies from their origin skill. Replaces the old `SkillAutoUpdateSweeper`.
 - 已存在的 legacy 技能副本无法再 update/append，须先规范化 —— 有意为之。
 - 模板三处保持一致：后端 `SkillTemplateValidator.SKILL_TEMPLATE`、工具 `TOOL_DESCRIPTION`（引用它）、
   前端 `agent-sphere-ui/src/pages/capabilities/skill/index.tsx` 的 `SKILL_TEMPLATE`/`SAMPLE_DEFINITION`。
+
+## run 失败原因必须落库（V87）—— 排查线上问题的前提
+
+**`agent_run.error_message` 是「这个 run 为什么挂」的唯一现场，缺了它就只能靠猜。**
+此前 `RuntimeEventListener#handleRunLifecycle` 的 FAILED 分支只写 status、把事件里的
+`errorMessage` 丢弃，而表上又没有对应列 —— 线上整批 run 被模型端打挂后**不留任何原因**。
+
+- **唯一收口点是 `RuntimeEventListener#handleRunLifecycle` 的 `case FAILED`。** 所有 FAILED 发布方
+  （`SessionRunner` 单轮失败 / `RuntimeOrchestrator` 提交期失败 / `OrphanRunSweeper` /
+  `ChatRuntimeService#failStuckWait`）都已经把原因放进事件，不要在各自实现里另写一遍。
+- **`RunConverter` 是手写的，加字段必须两个方向都改**（VO→DO 与 DO→VO），漏一边不报错、只会让
+  失败原因静默丢失。
+- **`LLMEvent.Error` 是事件不是异常。** `KernelLlmService` 过去只在 `catch` 里置 `success=false`，
+  而供应商常态是以事件回报错误 → 记录成 `success=true / error_message=NULL`，
+  **这类失败在库里完全不可见**。现在内层 consumer 会把事件错误记进 `errorEventRef`，finally 合并。
+  另外 catch 里的 `if (future.isCancelled()) return;` 会在赋值前提前返回，注意它对取消语义的影响。
+- **排查口径**：`agent_llm_interaction_record` 里 `prompt_tokens IS NULL AND duration_ms < 1000`
+  的记录 = 模型端秒回错误。`response_body = '{}'` **不是**错误信号 —— 只回 tool call 不回正文时
+  响应体天然为空。
+
+## 单轮 LLM 失败：重试预算与退避
+
+`llmTurnMaxRetries` 默认 3（合计 4 次尝试），退避 `LLM_TURN_RETRY_BASE_MS × 2^(attempt-1)`、
+封顶 `LLM_TURN_RETRY_MAX_MS`（`SessionRunner#llmTurnRetryBackoffMs`）。
+
+- **曾经是「固定 sleep(1s) + 1 次重试」= 合计 2 次尝试，线上因此整批挂掉**：模型端会**突发性连续**
+  秒回错误，实测有 run 在 9 秒内连撞 3 次即耗尽预算而 FAILED，只有一个恰好只撞 2 次的活了下来。
+  固定退避撞上突发窗口会在同一秒再打一次，**把一次抖动放大成连续失败**。
+- 重试门槛仍是「本轮无输出且无工具调用」（`SessionRunner` `runTurn` 内）—— 已产出部分内容或
+  已发过 tool call 时不重试，避免重复副作用。
+- **目前不做「可重试/不可重试」错误分类**：上下文超限（400）、鉴权失败重试纯属浪费。
+  V87 落库后已能拿到真实错误文案，是后续做分类的前提。
+
+## 等待恢复：`resumeFromWait` 的提交边界
+
+`resumeFromWait` 里 **`asyncHandleUserMessage` 一旦返回就等于恢复已提交**，此后再失败也不能把 run
+退回 WAITING：
+
+- 退回 WAITING → `onResumeOutcome` 把 wait 记录回置 PENDING（`wake_at` 已过期）→ cron 10s 内捞到并
+  再次 `claimForResume` → **再提交一次异步执行**，两个循环并发写同一个 run。
+- 提交**之前**失败则必须回退（`rollbackToWaiting`），否则 run 卡在 RUNNING 却没有任何循环在跑，
+  下次重试也会因状态不匹配被判 SKIPPED。
+- **补记 tool 成功结果（`recordWaitToolSucceeded`）是 best-effort 展示事件，自己吞异常。**
+  它曾与恢复共用一个 try，导致一次 timeline 写失败就把已成功的恢复降级成 ERROR。
+
+- **`loopCapped` 只在「真截断」时置位 —— COMPLETE 分支不得置。** 走到 COMPLETE 分支说明模型
+  主动交付了答案，那是一次正常完成；只有「最后一轮仍在调工具」被强收口才是截断。两者曾共用
+  `markLoopCapped`，导致「恰好在最后一轮收工」被当成半成品，任务守卫
+  （`AgentTaskServiceImpl`）一票否决、丢弃整份产出 —— 线上 run 1575
+  （`status=empty / stopReason=POOL_EXHAUSTED`，池子跑完的完整结论）就是这样只回给业务方
+  一句 `{"error":"run loop limit reached"}`。**判据要看语义（有没有被强收口），不要看位置。**
+- **`isLastLoop` 留在 n-1，硬收口指令提前到 n-3。** 两者刻意不同：`isLastLoop` 是 loop cap 的
+  **执行时机**；`FINAL_TURN_INSTRUCTION` 只是提示、不强制，而模型常常正好在最后一轮才收工
+  （run 1575/1569 两条都在最后一轮），只给 1 轮收尾太紧 —— 要么来不及写完整，要么只能把
+  「被打断」当成交付理由（run 1569 就是 `status:"INCOMPLETE"`）。故提前
+  `FINAL_TURN_INSTRUCTION_LEAD`=3 轮注入。
+- **硬收口文案不得声称「这是最后一轮」。** 提前注入后那句话是假的，模型可能据此以为还剩一次
+  机会而继续调工具。措辞必须是「接近上限 / 剩余轮次有限」。
+- **任务失败也必须让业务方看得见 run 产出。** `markTerminal` 只回 `{"error":...}` 会让业务方
+  完全看不到模型干了什么；`TaskCallbackBody.remark` 此前线上 153 个任务全为空串。loop cap
+  失败路径现用 `markTerminalWithRemark`（带 `replyJson(run)` + 原因文案）。
 
 ## Conventions
 
