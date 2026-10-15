@@ -52,6 +52,9 @@ Embeddable chat widget (shadow DOM, OIDC SSO, REST + SSE timeline chat):
 - **Image recognition (chat images)** — upload images with a chat message (`/api/v1/files/upload` → `fileKey`), rendered inline in the conversation as thumbnails with a click-to-zoom preview (main UI + widget); routes gate image support via `supports-attachment` and degrade to plain text when unavailable.
 - **Multi-level memory** — persistent runs, tool-call records with write-time JSON compression, and token-budget based context compaction.
 - **Human-in-the-loop clarification** — the LLM pauses with a `ask_clarification` tool and resumes via AG-UI interrupt/resume (`confirm` / `choice` / `input`).
+- **Suspend–resume `wait` tool** — a non-blocking `wait` (`builtin_10`) parks the run in a `WAITING` state instead of sleeping, so the wait happens *outside* the 60s tool-timeout box without holding a virtual thread or a parallelism slot; a memory timer wakes it, with a cron fallback, a stuck-run reconciler and bounded resume retries (§3.8a).
+- **Model-owned todo plan linked to skills** — `todowrite` is the single carrier of the plan; todo items point back at their source skill via structured `skillId` / `stepId` (§3.8b).
+- **Loop budget** — a per-run turn budget that survives park/resume, reported to the model every turn, with a hard-close nudge near the cap and a `loopCapped` flag that distinguishes a truncated run from one that legitimately finished (§3.1a).
 - **OIDC multi-provider SSO** — PKCE + JWKS-verified logins from any IdP, JIT user provisioning, plus full RBAC and audit logging.
 - **Per-user private resource copies** — each identity provider declares a `resource_template` JSON; on a user's first login the platform asynchronously provisions a **private copy** (model provider / api key / model route / completions / instance / mcp / skill / document) owned by that user, with row-level `created_by` isolation.
 - **Capability Open API** — external systems call `completions` and `tasks` over `/api/v1/api/*` with `code + subject + businessType` identity, plus `businessType`-scoped ownership checks and task callback URLs.
@@ -99,7 +102,26 @@ Each skill carries a `visibility`: `PRIVATE` (author only, default) or `PUBLIC` 
 
 Backend filter: `visibility='PUBLIC' AND created_by IS NOT NULL`. The explicit `created_by` reference makes `DataPermissionInterceptor` skip its ownership rewrite, so the Hub is a true cross-user listing (ordinary users are otherwise row-scoped to `created_by = <username>`). Installing (`POST /api/v1/capability/skill/{id}/install`) **forks** the source into your own skills — a PRIVATE copy with `origin_skill_id` back-linking the source, name auto-suffixed on collision (e.g. `skill (1)`), and the source's `install_count` incremented. Your own published skills do **not** show an Install button; unpublishing never affects already-installed copies.
 
-**Versioning & auto-update** — every skill carries a `version` (int, starts at 1; each content edit via `PUT /api/v1/capability/skill/{id}` bumps it). Installed copies record the source version at fork time (`origin_version`). On the **My Skills** tab you can flip **Auto update** on for any installed copy (`PUT /api/v1/capability/skill/{id}/auto-update`); a scheduler (`SkillAutoUpdateSweeper`, default every 5 min, configurable via `buukle.agent.skill.auto-update-interval`) then scans copies with auto-update enabled and — when `source.version > copy.origin_version` — fully syncs `name`/`description`/`definition` from the source (a true fork-track, so local renames are overwritten). If the source is deleted or unpublished, the copy is left untouched and its auto-update simply pauses. The sync uses a conditional `UPDATE ... WHERE id=? AND origin_version=?`, so multiple replicas never double-apply.
+**Skill body structure is validated** — a skill's `promptTemplate` must follow a fixed heading schema, because `## stepN` headings are what the todo/skill linkage (§3.8b) keys against:
+
+- exactly **one** `# <skill name>` H1, and it must come first;
+- at least one `## stepN <step name>`;
+- `### stepN.M <sub-step name>` must sit under the `## stepN` with the **same number**;
+- no heading level may be skipped (H1 → H3 without an H2 is rejected).
+
+Legacy definitions that carry a bare `{"prompt": ...}` with no heading structure are rejected too — they must be normalised before they can be updated or appended to. That is intentional.
+
+There is exactly **one** implementation of this rule: `SkillTemplateValidator` in the `common` module, returning either `null` (pass) or a violation list plus the canonical template. The **only** enforcement point is the service layer (`CapabilitySkillServiceImpl#validateDefinition`, called by both create and update), which throws `BizException(PARAM_INVALID)` — so both entry points (the UI form via `CapabilitySkillController`, and the agent's own `skill_manage` tool) are covered without duplicating the check. Because legacy definitions are rejected, the **default resource template's sample skill must itself be compliant**, since `SkillInitializer` reads it to seed a new account.
+
+The canonical template is kept in sync across three places: `SkillTemplateValidator.SKILL_TEMPLATE` (backend), the tool description that references it, and `SKILL_TEMPLATE` / `SAMPLE_DEFINITION` in `agent-sphere-ui/src/pages/capabilities/skill/index.tsx`.
+
+**Versioning & auto-update** — every skill carries a `version` (int, starts at 1; each content edit via `PUT /api/v1/capability/skill/{id}` bumps it). Installed copies record the source version at fork time (`origin_version`). On the **My Skills** tab you can flip **Auto update** on for any installed copy (`PUT /api/v1/capability/skill/{id}/auto-update`); a scheduler (`SkillSyncRunner`, default every 5 min via `buukle.agent.skill.auto-update-interval`) scans those copies and — when `source.version > copy.origin_version` — fully syncs `name`/`description`/`definition` from the source (a true fork-track, so local renames are overwritten). The sync uses a conditional `UPDATE ... WHERE id=? AND origin_version=?`, so multiple replicas never double-apply.
+
+> The scan predicate is deliberately **`auto_update = true AND origin_skill_id IS NOT NULL`** with **no time window**. The earlier `SkillAutoUpdateSweeper` filtered on `created_at >= now() - 7 days` — but a copy's `created_at` is its **install** time, so any copy installed more than 7 days ago was **never scanned again**. That is why auto-update appeared to "do nothing". `SkillSyncRunnerTest#sweep_queryHasNoTimeWindow` locks the fix in; do not add a window back.
+
+**Sync execution records** — the task's logger is suppressed by logback's `com.buukle.agent.capability = WARN` rule, so "did it run / how many did it sync" was unanswerable from logs. Every sweep therefore writes one `capability_skill_sync_run` row (V80) with `trigger_type`, `scanned_count`, `updated`, `skipped`, a per-copy skip detail, `skip_reason` and `elapsed_ms`. Skip reasons are enumerated in `SkillSyncOutcome` — notably `SOURCE_GONE` (source deleted or unpublished; the copy is left untouched) vs `VERSION_NOT_AHEAD` (nothing to do), which is exactly the distinction you need when nothing synced. **Trigger it on demand** with `POST /api/v1/capability/skill/sync-now` and poll `GET /api/v1/capability/skill/sync-runs` / `GET /sync-runs/{id}` — the same mirror of the session-cleanup endpoints, and the frontend reuses `useRecordedTask`. A kill switch (`buukle.agent.skill.auto-update-enabled`) and a sync-log retention window (`skill.sync-log-retention-days`) live in `agent_system_config` so they can change without a redeploy.
+
+![Skill Hub — cross-user public listing](agent-sphere-readme/ui-skill-hub-hub.png)
 
 ![Skill Hub — cross-user public listing](agent-sphere-readme/ui-skill-hub-hub.png)
 
@@ -145,6 +167,36 @@ The core loop of AgentSphere follows the **ReAct (Reasoning + Acting)** pattern,
 **Multi-turn tool call example:**
 
 ![Multi-turn tool call example](agent-sphere-readme/multi-loop-sequence.png)
+
+#### 3.1a Loop Budget — count, cap, and what the model is told
+
+The loop count is a **per-run budget**, not a per-call allowance. A run that suspends on `wait` or clarification and later resumes continues from where it left off, so a model cannot buy unlimited turns by parking repeatedly.
+
+**Resolution order** — `LoopLimitResolver`, highest priority first:
+
+| Priority | Source | Configured at | Default |
+|---|---|---|---|
+| 0 | `PINNED` | the run's own `loop_limit` column (V88) | — |
+| 1 | `INSTANCE` | `agent_instance.max_loop_count` | unset |
+| 2 | `TASK` | `runner.task-max-loop-count` (task-triggered runs) | 2000 |
+| 3 | `CHAT` | `runner.max-loop-count` | 128 |
+
+**Why the budget is pinned.** A run re-enters the loop from five places — first `startRun`, `wait` resume, clarification resume (×2) and the stuck-`WAITING` reconciler. Only the first runs on the task request thread, which is where the `TaskLoopLimitHolder` ThreadLocal that carries the `TASK` allowance lives; the other four run on scheduler threads where it is null and the budget silently fell back to the much smaller `CHAT` value mid-run. V82 pinned the *counter* (`loop_count`); V88 pins the *denominator* (`loop_limit`) as well, so the budget cannot drift because of a lost ThreadLocal, an instance `max_loop_count` edited mid-run, or a config change. The two are written by the same `updateRun` — no extra write. Sub-agent loops are deliberately **not** pinned: `SessionSubRunner` is a single synchronous `for` loop with no park/resume, so its limit cannot drift within one call.
+
+**What the model is told.** Every turn appends a tail system segment reporting `Loop n/total` and the remaining count (both 1-based, so "0 turns remaining" can never appear); within 5 turns of the cap it adds a nudge to converge. From **3 turns** before the cap it also appends a hard-close instruction to stop calling tools and deliver the answer. Both are **advisory** — the `while (loopCount < maxLoopCount)` condition is the only thing that actually enforces the cap.
+
+Two subtleties worth knowing:
+
+- The tail block is **rebuilt every turn, not edited in place**. Tool turns append assistant/tool/observation messages after it, so an in-place update would leave a stale copy stranded mid-history — contradicting itself on "turns remaining" and burning context.
+- The hard-close wording deliberately says *"approaching the hard loop limit"* rather than *"this is your final turn"*. Injected 3 turns early, the latter would be false, and a model told it has one turn left may keep calling tools.
+
+**`loopCapped` means "truncated", not "ran long".** It is set only when the model was still calling tools on the final turn and got cut off. A run that simply *finished* on the last allowed turn is a normal completion and is **not** marked. This distinction matters: the task guard (§5.2) fails loop-capped tasks instead of running the structured-extraction phase, and conflating the two used to discard complete results — a run that finished with `status=empty, stopReason=POOL_EXHAUSTED` had its entire structured conclusion replaced by `{"error": "run loop limit reached"}`.
+
+#### 3.1b Per-turn LLM retry
+
+A turn that errors with **no output and no tool calls** this attempt is retried in place, up to `runner.llm-turn-max-retries` attempts (default 3) with **exponential backoff** (1s → 2s → 4s, capped at 8s). Once a turn has produced partial text or emitted a tool call it is not retried, to avoid duplicating side effects.
+
+The previous fixed `sleep(1s)` with a single retry was actively harmful against a provider that fails in bursts: fixed backoff re-hits the same instant and turns one blip into consecutive failures, and 2 attempts were not enough — production runs were killed by three failures inside 9 seconds while a run that happened to hit only two survived. Note there is no retryable/non-retryable classification yet, so a permanent error (context-length 400, auth failure) is retried too; now that the provider error is persisted (§4.2.2) this can be made precise later.
 
 ### 3.2 Multi-level Memory System
 
@@ -286,7 +338,7 @@ Every tab the plugin navigates, opens, or follows (target=_blank / window.open) 
 
 ### 3.6 Timeout and Cancellation Chain
 
-Stop/cancel is **session-level**: `POST /api/v1/runtime/{sessionId}/stop` stops the current run of the session regardless of which backend replica handled the request — no `runId` required. The cancel flag lives in Redis (`runtime:cancel-session:{sessionId}`) and the `SessionRunner` loop checks it at every cancellation point (loop top, after each turn, before/during/after tool fibers, and the LLM turn), terminating the run and publishing the cancel terminal event. The same endpoint also cancels a parked `AWAITING_USER` run (dismissing pending clarifications).
+Stop/cancel is **session-level**: `POST /api/v1/runtime/{sessionId}/stop` stops the current run of the session regardless of which backend replica handled the request — no `runId` required. The cancel flag lives in Redis (`runtime:cancel-session:{sessionId}`) and the `SessionRunner` loop checks it at every cancellation point (loop top, after each turn, before/during/after tool fibers, and the LLM turn), terminating the run and publishing the cancel terminal event. The same endpoint also cancels a **parked** run — both `AWAITING_USER` (dismissing pending clarifications) and `WAITING` (cancelling the pending wait row). A parked run has already left the loop, so stopping it must write the terminal state directly rather than only setting the cancel flag: nothing would be left to consume that flag.
 
 ![Timeout and cancellation chain](agent-sphere-readme/timeout-cancel-chain.png)
 
@@ -335,6 +387,48 @@ Users can cancel a pending clarification at any time:
 | `clarification_expired` | 30-minute TTL reached | Card grays out |
 | `clarification_dismissed` | Run cancelled while awaiting | Card shows dismissed |
 
+### 3.8a Wait Tool (Suspend–Resume)
+
+`wait` (`builtin_10`) is a **built-in that does not block**. The tool body only writes one `agent_pending_wait` row and returns `{"status":"waiting"}` immediately; `SessionRunner` then breaks out of the loop and the run sits in the parked state `WAITING` until the timer fires, at which point the original run is resumed.
+
+**Why park instead of sleep.** A regular tool must finish inside one `tool.execution-timeout` (60s) box, so "wait longer than 60s" is simply unsatisfiable. Parking puts the wait *outside* that box: it holds no virtual thread, no `maxParallel` semaphore slot, and no tool/step timeout. `FiberSet` needs no change at all — the suspension decision lives entirely outside the loop, exactly as `ask_clarification` proved.
+
+**How the model is told.** Waking is not guaranteed, so the description forces the model to re-read the result with `getContent` first and forbids repeating the same wait — the same "re-verify after waiting" discipline `getContent(mode=ready)` uses.
+
+| Property | Value |
+|---|---|
+| Row status lifecycle | `PENDING` → `RESUMED` (claimed) / `CANCELLED` / `FAILED` |
+| Bounds | clamped to `MIN_WAIT_MS = 100` … `MAX_WAIT_MS = 600000` (10 min) |
+| Wake path 1 | `PendingWaitWakeScheduler` — one in-memory timer per row |
+| Wake path 2 | `WaitWakeTask` — cron every 10s, Redisson lock `scheduler:pending-wait` (a replica restart loses the in-memory timers) |
+| Rescue | `WaitingRunReconciler` — sweeps `WAITING` runs older than `wait.reconcile-stale-minutes` |
+| Resume retries | up to `MAX_RESUME_ATTEMPTS = 5` |
+
+**Both wake paths claim with a single conditional `UPDATE ... WHERE status='PENDING'`**, never "select then update" — without the CAS, a timer and the cron firing at the same moment would resume the same run twice. The CAS is also what forces a failure path: once a row is `RESUMED`, `listDue` and `claimForResume` will never pick it up again, so a resume that throws would strand the run in `WAITING` forever. `resumeFromWait` therefore returns a `ResumeOutcome` (`RESUMED` / `SKIPPED` / `ERROR`) instead of swallowing the exception, and the caller decides: `ERROR` requeues the row to `PENDING` with `attempts+1` plus a `last_error`, and once the retry budget is exhausted the row is marked `FAILED` and the run receives a terminal event so the UI does not hang on "running".
+
+Two boundaries that are easy to get wrong:
+
+- **Once `asyncHandleUserMessage` returns, the resume is committed** — nothing may roll the run back to `WAITING` afterwards. Rolling back would put the row back in `PENDING`, let the cron claim it again, and **submit a second concurrent loop for the same run**. Failures *before* the submit must roll back, or the run is left `RUNNING` with no loop driving it and every later retry is misjudged as `SKIPPED`.
+- The tool-success bookkeeping event is best-effort: it swallows its own exceptions and can never fail the resume.
+
+`WAITING` is a real run state, so it is wired through the whole state machine — the run row, the `run_waiting` SSE event, the UI, the stop button and the session-cleanup guard. Two deliberate asymmetries: `WAITING` is in the frontend's pull-trigger set (so the panel refreshes to "waiting") but **not** in the terminal set (so the composer stays locked), and the stop button must set the terminal state directly rather than only setting a cancel flag, because the parked loop has already exited and nothing would consume that flag. Sub-agents must have `wait` stripped from their toolset — the suspension decision exists only in the main loop, so leaving it enabled creates a pending row that nobody ever claims.
+
+### 3.8b Todo Plan & Skill Linkage
+
+The **todo list is the single source of the plan**, maintained by the model through the `todowrite` tool and persisted in `agent_session_todo`. Reading a skill is a pure read: it never mutates the plan. (An earlier implementation seeded todos from a skill on `get`; it was removed because it replaced the model's own plan as an invisible side effect.)
+
+`todowrite` is a **full replacement** — the model must resend the complete list every time, since a delete-then-insert implementation would otherwise silently drop items the model omitted.
+
+| Scenario | Behaviour |
+|---|---|
+| No skill | The model builds its own plan. |
+| The skill *is* the whole plan | Todos are laid out as `N. <title>` / `N.M <title>` from `## stepN` / `### stepN.M`. |
+| The skill covers *some* steps | The existing plan is **kept**; only the source fields are back-filled. |
+
+Each todo item carries a **structured** source pointer rather than a text link: `skillId` + `stepId` (V84, `agent_session_todo.skill_id` / `step_id`, with `stepId` holding the raw identifier as it appears in the heading). When the model works an item it looks the body back up with `skill_library(action=get, skillId=…, sectionHeading=stepId)` — heading matching is a case-insensitive substring match, and requesting an H2 section returns its H3 children with it. A sub-agent inherits the full toolset and the parent model route, with an optional `agentRef=instance:<id>` prefixing its system prompt.
+
+No aggregation is needed when several skills are involved: every item carries its own source pointer, so there is no longer a "current skill" to keep in sync.
+
 ### 3.9 Delegate: Multi-Agent Delegation & DAG Orchestration
 
 ![Multi-Agent DAG orchestration via delegate](agent-sphere-readme/delegate-dag-orchestration.png)
@@ -380,22 +474,22 @@ Key `delegate.*` config: `enabled`, `maxDagTasks`, `maxDagRetries`, `maxParallel
 
 ### 4.1 Configuration Reference
 
+The keys you are most likely to touch, all under `buukle.agent.*`. **This is a subset** — the complete reference (every `buukle.agent.*` and `hri-ai.*` key, including `wait`, `mcp`, `audit`, `crypto`, `lock`, `delegate` and the web-fetch/Jina tuning blocks) is in **[CONFIG_REFERENCE.md](CONFIG_REFERENCE.md)**, which is the source of truth.
+
 | Config Item | Default | Description |
 |-------------|---------|-------------|
 | `session.idle-timeout` | 30m | Session idle timeout |
 | `session.max-concurrent-runs` | 10 | Maximum concurrent executions |
-| `runner.max-loop-count` | 128 | Maximum loop count per run |
-| `runner.max-screenshots-per-run` | 20 | Max screenshot observations injected into the model context per run |
+| `runner.max-loop-count` | 128 | Maximum loop count per run (§3.1a) |
+| `runner.task-max-loop-count` | 2000 | Higher loop limit for task-triggered runs (§3.1a) |
 | `runner.turn-timeout` | 180s | Single LLM turn timeout |
+| `runner.llm-turn-max-retries` | 3 | Per-turn retries with exponential backoff (§3.1b) |
 | `runner.compaction.budget-ratio` | 0.7 | Compaction trigger threshold (ratio of maxInputTokens) |
-| `llm.connect-timeout` | 30s | LLM API connection timeout |
-| `llm.read-timeout` | 60s | LLM API read timeout |
 | `llm.stream-timeout` | 120s | Total streaming call timeout |
 | `tool.max-parallel` | 3 | Maximum parallel tool executions |
-| `tool.execution-timeout` | 60s | Single batch tool execution timeout |
-| `tool.submit-timeout` | 30s | Tool submission timeout |
 | `distributed.owner-lease` | 5m | Session executor owner lease (multi-replica takeover) |
 | `distributed.orphan-sweep-interval` | 30s | Orphan-run sweep interval (stale owner → FAILED → re-wake) |
+| `hri-ai.tasks.min-timeout-seconds` | 10800 | Task timeout floor, 3h (§5.2) |
 
 ### 4.2 Observability
 
@@ -425,6 +519,7 @@ reasoning_token   → "🤔 The user is asking about weather, I need to open a w
 | `run_failed` | Run fails | Error prompt |
 | `run_cancelled` | Run cancelled | Cancellation notice |
 | `run_awaiting_user` | Run pauses for clarification | Set to AWAITING_USER |
+| `run_waiting` | Run parks on the `wait` tool | Set to WAITING (auto-resumes when the timer fires) |
 | `tool_call_started` | Tool PENDING | Tool call list |
 | `tool_call_in_progress` | Tool running | Running icon |
 | `tool_call_succeeded` | Tool completes | ✅ icon |
@@ -477,6 +572,14 @@ Run interactions (list view):
 Run interaction detail:
 
 ![Run interaction detail](agent-sphere-readme/Interactions-of-run-detail.png)
+
+**Why a run failed is persisted** (`agent_run.error_message`, V87). Every terminal `FAILED` publisher already carries a reason in its event — a failed LLM turn, a submit-time validation/context failure, the orphan sweeper, and the stuck-`WAITING` rescuer — so `RuntimeEventListener`'s `FAILED` branch is the single sink that writes it down. Before this, the listener wrote only the status and dropped the event's `errorMessage`, and the table had no column for it, so a failed run left **no reason at all**.
+
+**Troubleshooting heuristics** — the interactions table is the other half of the story, but it is easy to misread:
+
+- A model endpoint returning an **immediate error** shows up as `prompt_tokens IS NULL AND duration_ms < 1000` on a `CHAT_REPLY` row. That signature is how a burst of upstream failures is identified.
+- `response_body = '{}'` is **not** an error signal. A turn that returns only tool calls with no prose legitimately has an empty body; that is a normal turn.
+- Provider errors arrive as an **event**, not an exception, so `success` used to stay `true` for exactly the failures that kill runs. `KernelLlmService` now records the event error too, which also flips the corresponding assistant timeline row to failed. That is intended — the turn genuinely failed, even if a retry later recovered the run.
 
 #### 4.2.3 Session Panel
 
@@ -791,6 +894,20 @@ node agent-sphere/local-dev/mock-oidc-server.mjs      # listens on :9000
 
 The RSA key is intentionally fixed across restarts so the backend's cached JWKS keeps verifying id_tokens (avoids `S0006`). Point the `agent_identity_provider` row at it (`code=bole`, `issuer=http://localhost:9000`, endpoints under `/oauth2/...`, `jwks_url=http://localhost:9000/jwks`, scopes `openid email profile`, enabled).
 
+### 4.14 Session Data Cleanup (Disk Reclamation)
+
+`agent_session_cleanup_run` tracks a scheduled job (`SessionCleanupTask`) that **hard-deletes** expired session data so the database stops growing. It is the one sanctioned exception to "never hard-delete": `agent_llm_interaction_record` stores full request/response/reasoning text, so a logical `delete_flag` update would leave every byte on disk. The cleanup SQL therefore bypasses MyBatis-Plus on purpose and deliberately does **not** filter on `delete_flag` — already-logically-deleted rows occupy space too.
+
+**What counts as expired** — `session.created_at < cutoff AND session.updated_at < cutoff`, plus two `NOT EXISTS` guards for `PENDING`/`RUNNING` runs and `QUEUED`/`RUNNING` tasks, so an in-flight execution is never deleted out from under itself. A long-running task only updates the `task`/`run` rows and never the session row, so elapsed time alone is not a sufficient signal. `AWAITING_USER` is intentionally **not** guarded — a clarification nobody ever answers would otherwise block cleanup forever. Parked `WAITING` runs are guarded.
+
+**Delete order is a foreign-key contract.** Only two real FKs exist and neither cascades (`agent_run.session_id → agent_session`, `agent_task_artifact.task_id → agent_task`); the mapper's method order *is* the execution order, and a unit test asserts it with `InOrder`. Reordering it breaks production with `violates foreign key constraint`.
+
+**Every run is recorded.** Both the cron and the manual endpoint write a row to `agent_session_cleanup_run`, and the RUNNING row is inserted **before** the lock is taken — so "lock was busy" and "kill switch off" also leave a trace (`status=SKIPPED` plus a `skip_reason`); otherwise nobody could explain why the disk did not shrink. Terminal states are `SUCCESS` (with per-table `table_stats`), `SKIPPED`, and `FAILED` (with `error_message`, and the exception is still rethrown). Previews are recorded too — an irreversible delete needs its audit trail. The run table prunes itself as the job's final phase.
+
+**Manual trigger is asynchronous**: `POST /api/v1/instance/session-cleanup` only *submits* — it inserts the RUNNING record on the request thread and returns immediately, with the work running on `runtimeAsyncExecutor`, because a round can span 200×50 sessions. Poll `GET /api/v1/instance/session-cleanup/runs` (and `/runs/{id}`) for progress and result; a `stale` flag computed from `finished_at` keeps a crashed process's zombie RUNNING row from being mistaken for an in-flight cleanup. **`dryRun` defaults to `true`** — the request body must explicitly set `"dryRun": false` to actually delete.
+
+Retention days and a kill switch live in `agent_system_config` (`config_group='session'`) so they can change without a redeploy, while the cron, batch size and sleep interval live under `buukle.agent.session` in `application.yml`. Like the skill-sync job, the task takes a Redisson lock (`scheduler:session-cleanup`) because `replicas: 2`. Note that a hard delete only frees space **for reuse inside PostgreSQL**; the data files stay the same size on disk, so the job logs a `VACUUM (FULL, ANALYZE)` hint rather than running it (which would take an ACCESS EXCLUSIVE lock).
+
 ---
 
 ## 5. Capability Open API (External Integration)
@@ -848,9 +965,23 @@ curl -X POST "http://localhost:8080/api/v1/api/tasks/7/stop?code=business&subjec
 
 Response is a `TaskVO` (`id`, `status` `QUEUED/RUNNING/COMPLETED/FAILED/CANCELLED`, `sessionId`, `runId`, `resultJson`, …). When `callbackUrl` is set, the backend POSTs task progress/final results there. Completed tasks persist two-phase structured outputs as **task artifacts** (see below).
 
+**Task phases.** A task advances through `execute` → `extract` → `refine`, tracked in `poll_phase`:
+
+1. **`execute`** — the real work run. When it reaches `COMPLETED`, the poller moves on; when it was **truncated by the loop cap** (`loop_capped`), the task is failed instead and extraction is skipped, because a half-finished run must not masquerade as a complete one. That failure still returns the run's own output (plus a human-readable `remark`) so the caller can see what the run actually produced.
+2. **`extract`** — a second run re-formats the conversation into the `expectedOutput` JSON Schema. Its output is validated against the contract; on failure the task moves to `refine`.
+3. **`refine`** — one correction round fed the validation errors. If it still fails, the last output is returned as-is rather than retrying forever.
+
+Each artifact is stored in `agent_task_artifact` with the phase that produced it.
+
+**Timeout.** Effective timeout = `max(taskTimeoutSeconds, hri-ai.tasks.min-timeout-seconds)`, falling back to `hri-ai.tasks.max-poll-seconds` (3600s) when the caller omits `taskTimeoutSeconds`; the floor defaults to 0 (disabled). Exceeding it fails the task with `task poll timeout`.
+
+The **floor exists because the default alone does nothing in practice**: every task carries its own `task_timeout_seconds`, and callers overwhelmingly send an explicit 3600 — so raising `max-poll-seconds` would only affect tasks that omit the field. `min-timeout-seconds` is the only place that can raise the real timeout without changing the caller. It defaults to **10800s (3h)**, chosen from the observed distribution (mean 838s, max 9818s, nothing above 3h). The trade-off is that the server overrides an explicit caller value, which is deliberate.
+
+The same resolved value also sets the **task-level MCP credential TTL** (`timeout + 15 min`) — deliberately a single chokepoint, so the credential can never expire before the task it belongs to.
+
 ### 5.3 Task Artifacts (任务产物)
 
-Two-phase refined outputs are stored in `agent_task_artifact` and exposed on the admin side:
+Refined outputs from the `extract` / `refine` phases (§5.2) are stored in `agent_task_artifact` — each row records which phase produced it — and exposed on the admin side:
 
 - `GET /api/v1/admin/task-artifacts` — paged list (`keyword`, `taskId`, `page`, `size`), gated by `admin:tasks:read`, row-scoped by `created_by`.
 - `GET /api/v1/admin/task-artifacts/{id}` — detail with the full `content` JSON and `schemaRef`.

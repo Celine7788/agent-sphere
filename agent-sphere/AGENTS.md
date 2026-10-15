@@ -339,6 +339,18 @@ TTL（`submit` 签发 = 超时 + 15min），因此两者天然一致，不会出
 - Logging: `com.buukle` → DEBUG; `*.repository` packages and `com.buukle.agent.capability` → WARN.
 - Key libs beyond Spring: langgraph4j, redisson, resilience4j, caffeine, hutool, victools, swagger.
 
+### application.yml：缩进错了会**静默失效**
+
+`AgentRuntimeProperties` 是**唯一**的 `@ConfigurationProperties(prefix = "buukle.agent")`；`wait.*` 那三项
+（`wake-cron` / `reconcile-*`）靠 `@Value` / `@Scheduled` 直接读，不进绑定类。因此**只有这一处绑定树**。
+
+- **曾踩过**：`web-read` / `web-fetch` / `web-read-advanced` / `web-fetch-advanced` / `js-render` 五块被误缩进
+  到 `wait:` 之下（正确位置是 `tool:`）。`wait` 没有对应的绑定目标，Spring 的 `ignoreUnknownFields`
+  默认 `true`，于是这些键被**静默忽略**、代码一直走类内默认值 —— 当时两者取值恰好相同，所以没有任何
+  症状；一旦有人改那几个 yml 值就会「改了不生效、也不报错」。
+- **加/改配置键后自查**：确认路径与绑定类字段一致（`buukle.agent.<block>.<field>`），可参考
+  `CONFIG_REFERENCE.md`（仓库根，与该文件同源）。误缩进不会抛异常，只会无声失效。
+
 ## Code style
 
 - Avoid `Map` as a method input parameter. Use typed DTOs/POJOs so signatures, validation, and refactoring stay explicit. A generic `Map<String, Object>` is only acceptable at framework boundaries (e.g. MyBatis result maps, HTTP param bags) and must be converted to a typed object at the earliest layer.

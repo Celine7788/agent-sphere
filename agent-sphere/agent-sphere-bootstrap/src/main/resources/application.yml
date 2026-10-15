@@ -128,17 +128,10 @@ buukle:
       execution-timeout: 60s                       # 工具执行超时 / Tool execution timeout
       cli-timeout: 30s                             # CLI 工具超时 / CLI tool timeout
 
-    # ============================================================
-    # wait 工具（挂起-恢复）/ Wait Tool (suspend-resume)
-    # ============================================================
-    wait:
-      # 唤醒补偿扫描 cron。主路径是每条等待记录一个内存定时器；
-      # 副本重启/发布会让定时器全丢，这一层按 wake_at 兜底（CAS 保证不重复恢复）。
-      wake-cron: "*/10 * * * * ?"                   # 唤醒补偿扫描 / Wait wake compensation sweep
-      # 「卡住 WAITING」对账：扫描超时仍 WAITING 且名下无 PENDING 记录的 run，直接再推进；失败置终态。
-      reconcile-interval: "PT60S"                   # 对账扫描间隔 / Stuck-WAITING reconcile interval
-      reconcile-stale-minutes: 15                   # 判定"卡住"的阈值(分钟，需 > MAX_WAIT_MS=10) / Stale threshold (min)
-
+      # 以下 web-read / web-fetch / web-read-advanced / web-fetch-advanced / js-render
+      # 绑定到 ToolConfig.webRead 等字段。此前它们被误缩进到 wait: 之下，而 wait 没有对应的
+      # @ConfigurationProperties 目标，导致这些键被静默忽略、代码一直走类内默认值（两者恰好相同，
+      # 所以没有暴露）。改这里的值时务必确认它在 tool: 之下。
       # ---- 网页读取工具 / Web Read Tool ----
       web-read:
         connect-timeout: 10s                       # 连接超时 / Connect timeout
@@ -174,6 +167,18 @@ buukle:
         max-wait-millis: 10000                     # 最大等待时间（毫秒）/ Max wait time (ms)
         background-js-timeout: 3000                # 后台 JS 超时（毫秒）/ Background JS timeout (ms)
         max-pool-size: 3                           # 浏览器池最大大小 / Browser pool max size
+
+    # ============================================================
+    # wait 工具（挂起-恢复）/ Wait Tool (suspend-resume)
+    # 仅 wake-cron / reconcile-* 三项（由 @Value / @Scheduled 直接读取，不经 @ConfigurationProperties）
+    # ============================================================
+    wait:
+      # 唤醒补偿扫描 cron。主路径是每条等待记录一个内存定时器；
+      # 副本重启/发布会让定时器全丢，这一层按 wake_at 兜底（CAS 保证不重复恢复）。
+      wake-cron: "*/10 * * * * ?"                   # 唤醒补偿扫描 / Wait wake compensation sweep
+      # 「卡住 WAITING」对账：扫描超时仍 WAITING 且名下无 PENDING 记录的 run，直接再推进；失败置终态。
+      reconcile-interval: "PT60S"                   # 对账扫描间隔 / Stuck-WAITING reconcile interval
+      reconcile-stale-minutes: 15                   # 判定"卡住"的阈值(分钟，需 > MAX_WAIT_MS=10) / Stale threshold (min)
 
     # ============================================================
     # Controller 日志截断配置 / Controller Log Config

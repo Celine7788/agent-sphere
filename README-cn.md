@@ -52,6 +52,9 @@
 - **图片识别（聊天图片）** — 聊天消息可携带图片（`/api/v1/files/upload` 上传拿 `fileKey`），会话中以缩略图 + 点击放大预览展示（主 UI 与 Widget 均支持）；路由通过 `supports-attachment` 门控图片能力，无可用图片路由时自动降级为纯文本继续。
 - **多级记忆** — 持久化 run、工具调用记录（写时 JSON 压缩）、基于 token 预算的上下文压缩。
 - **人工介入澄清（Human-in-the-loop）** — LLM 通过 `ask_clarification` 工具暂停提问，AG-UI interrupt/resume 恢复执行（`confirm` / `choice` / `input`）。
+- **挂起-恢复的 `wait` 工具** — 不阻塞的 `wait`（`builtin_10`）让 run 停车进入 `WAITING`，而不是 sleep —— 等待因此发生在 60s 工具超时盒子**之外**，且不占虚拟线程、不占并行信号量；由内存定时器唤醒，并有 cron 兜底、卡住对账与有界恢复重试（§3.8a）。
+- **模型主导、与技能关联的待办计划** — `todowrite` 是计划的唯一载体；待办条目通过结构化的 `skillId` / `stepId` 指回来源技能（§3.8b）。
+- **轮次预算** — per-run 的轮次预算，跨挂起恢复不丢失，每轮告知模型；临近上限有硬收口提醒，`loopCapped` 区分「被截断」与「正常完成」（§3.1a）。
 - **OIDC 多认证源 SSO** — PKCE + JWKS 验签，任意 IdP 登录、JIT 开通本地用户，配合完整 RBAC 与审计日志。
 - **每用户私有资源副本** — 每个身份源声明 `resource_template` JSON；用户首次登录时平台**异步**为其生成一份**私有副本**（模型供应商 / API Key / 模型路由 / completions / 实例 / MCP / 技能 / 文档），归属该用户并以 `created_by` 行级隔离。
 - **能力开放 API** — 外部系统以 `code + subject + businessType` 身份直连 `/api/v1/api/*` 调用 completions 与 tasks，按 businessType 会话层归属校验，任务支持回调 URL。
@@ -99,7 +102,24 @@
 
 后端过滤条件为 `visibility='PUBLIC' AND created_by IS NOT NULL`：显式引用 `created_by` 使 `DataPermissionInterceptor` 跳过归属改写，Hub 成为真正的跨用户公开列表（普通用户的其他查询默认都被改写为 `created_by = <username>` 进行行级隔离）。「安装」（`POST /api/v1/capability/skill/{id}/install`）会把源技能 **fork** 到自己的技能列表——私有副本、`origin_skill_id` 回指源技能、同名自动加后缀（如 `skill (1)`）、源技能 `install_count` +1。自己发布的技能**不**显示「安装」按钮；取消公开发布不影响已安装的副本。
 
-**版本与自动更新** —— 每个技能带一个 `version`（int，默认 1；每次内容编辑 `PUT /api/v1/capability/skill/{id}` 自增）。安装副本在 fork 时记录源版本（`origin_version`）。在「我的技能」页可对任意已安装副本开启「自动更新」（`PUT /api/v1/capability/skill/{id}/auto-update`）；后台定时任务（`SkillAutoUpdateSweeper`，默认每 5 分钟，可用 `buukle.agent.skill.auto-update-interval` 配置）扫描开启自动更新的副本，当 `源.version > 副本.origin_version` 时把源的 `name`/`description`/`definition` **全量同步**到副本（真正的 fork 追踪，副本上本地改名会一并被覆盖）。源被删除或取消公开时，副本保持不动，其自动更新自然暂停。同步采用条件更新 `UPDATE ... WHERE id=? AND origin_version=?`，多副本部署下同一副本不会被重复覆盖。
+**技能正文结构会被强校验** —— `promptTemplate` 必须符合固定标题结构，因为 `## stepN` 正是待办/技能关联（§3.8b）所依赖的锚点：
+
+- 有且**仅有一个** `# <技能名>` H1，且必须是第一个标题；
+- 至少一个 `## stepN <步骤名>`；
+- `### stepN.M <子步骤名>` 必须挂在**同编号**的 `## stepN` 之下；
+- 不得层级跳跃（H1 直接到 H3、缺 H2 会被拒）。
+
+旧的 `{"prompt": ...}` 定义（没有标题结构）同样会被拒 —— 必须先规范化才能 update 或 append。这是有意为之。
+
+这套规则**只有一处实现**：`common` 模块的 `SkillTemplateValidator`，返回 `null`（通过）或「违规清单 + 标准模板」。**唯一强制点是 service**（`CapabilitySkillServiceImpl#validateDefinition`，create/update 都调它），失败抛 `BizException(PARAM_INVALID)` —— 因此两条入口（UI 表单经 `CapabilitySkillController`、agent 自己的 `skill_manage` 工具）都覆盖到，且不需要在工具里再复制一份校验。由于 legacy 定义会被拒，**默认资源模板里的「示例技能」本身必须合规** —— `SkillInitializer` 会读它为新账号开户初始化。
+
+规范模板三处保持一致：后端 `SkillTemplateValidator.SKILL_TEMPLATE`、引用它的工具描述、以及 `agent-sphere-ui/src/pages/capabilities/skill/index.tsx` 的 `SKILL_TEMPLATE` / `SAMPLE_DEFINITION`。
+
+**版本与自动更新** —— 每个技能带一个 `version`（int，默认 1；每次内容编辑 `PUT /api/v1/capability/skill/{id}` 自增）。安装副本在 fork 时记录源版本（`origin_version`）。在「我的技能」页可对任意已安装副本开启「自动更新」（`PUT /api/v1/capability/skill/{id}/auto-update`）；后台定时任务（`SkillSyncRunner`，默认每 5 分钟，可用 `buukle.agent.skill.auto-update-interval` 配置）扫描这些副本，当 `源.version > 副本.origin_version` 时把源的 `name`/`description`/`definition` **全量同步**到副本（真正的 fork 追踪，副本上本地改名会一并被覆盖）。同步采用条件更新 `UPDATE ... WHERE id=? AND origin_version=?`，多副本部署下同一副本不会被重复覆盖。
+
+> 扫描条件刻意只按 **`auto_update = true AND origin_skill_id IS NOT NULL`**、**不带任何时间窗口**。早期的 `SkillAutoUpdateSweeper` 过滤了 `created_at >= now() - 7 天`，而副本的 `created_at` 是**安装时间** —— 装得超过 7 天的副本就**永远不再被扫描**。这正是「自动更新看起来毫无效果」的根因。`SkillSyncRunnerTest#sweep_queryHasNoTimeWindow` 锁住了这个修复，**不要把时间窗口加回去**。
+
+**同步执行记录** —— 该任务的 logger 被 logback 的 `com.buukle.agent.capability = WARN` 规则压住，所以「任务跑了没跑、扫到几条、同步了几条」光看日志永远无法回答。因此每轮扫描都会写一行 `capability_skill_sync_run`（V80），记录 `trigger_type`、`scanned_count`、`updated`、`skipped`、逐副本跳过明细、`skip_reason` 与 `elapsed_ms`。跳过原因由 `SkillSyncOutcome` 枚举 —— 尤其是 `SOURCE_GONE`（源被删除或取消公开，副本保持不动）与 `VERSION_NOT_AHEAD`（无事可做）的区分，恰好就是「什么都没同步」时你需要的那条信息。**可手动触发**：`POST /api/v1/capability/skill/sync-now`，轮询 `GET /api/v1/capability/skill/sync-runs` 与 `GET /sync-runs/{id}` —— 与会话清理端点同一套镜像，前端复用 `useRecordedTask`。开关（`buukle.agent.skill.auto-update-enabled`）与同步日志保留期（`skill.sync-log-retention-days`）放在 `agent_system_config`，改配置无需重新部署。
 
 ![技能 Hub —— 跨用户公开列表](agent-sphere-readme/ui-skill-hub-hub.png)
 
@@ -145,6 +165,36 @@ AgentSphere 的核心循环遵循 **ReAct (Reasoning + Acting)** 模式，将 LL
 **多轮工具调用示例：**
 
 ![多轮工具调用示例](agent-sphere-readme/multi-loop-sequence.png)
+
+#### 3.1a 轮次预算 —— 计数、上限，以及模型看到什么
+
+轮次是 **per-run 预算**，不是「单次调用」的额度。run 因 `wait` 或澄清挂起、之后恢复时，会从原处继续数，因此模型无法靠反复挂起来无限续命。
+
+**解析优先级** —— `LoopLimitResolver`，从高到低：
+
+| 优先级 | 来源 | 配置位置 | 默认值 |
+|---|---|---|---|
+| 0 | `PINNED` | run 自身的 `loop_limit` 列（V88） | — |
+| 1 | `INSTANCE` | `agent_instance.max_loop_count` | 未设置 |
+| 2 | `TASK` | `runner.task-max-loop-count`（任务触发的 run） | 2000 |
+| 3 | `CHAT` | `runner.max-loop-count` | 128 |
+
+**为什么要固化预算。** 一个 run 有 5 个入口会重入循环 —— 首次 `startRun`、`wait` 恢复、澄清恢复（×2）、卡住 `WAITING` 的对账抢救。只有首次跑在任务请求线程上，那里才有承载 `TASK` 提额的 `TaskLoopLimitHolder`；其余 4 个都在调度线程上，该 ThreadLocal 为 null，预算会在同一个 run 中途静默回落到小得多的 `CHAT` 值。V82 固化了**计数器**（`loop_count`），V88 把**分母**（`loop_limit`）也固化，预算因此不会因为 ThreadLocal 丢失、运行中改实例 `max_loop_count`、或改配置而漂移。两者由**同一次** `updateRun` 写入，不额外增加写。子 Agent 循环刻意**不**固化：`SessionSubRunner` 是单次同步 `for` 循环、没有挂起/恢复，一次调用内上限不会漂移。
+
+**模型会看到什么。** 每轮都会追加一段尾部 system 片段，报告 `Loop n/total` 与剩余轮数（均 1 起算，所以永远不会出现「剩 0 轮」）；距上限 5 轮内会追加一句催促收口。距上限 **3 轮**起，还会追加一条硬收口指令，要求停止调用工具并交付答案。两者都只是**提示** —— 真正强制上限的只有 `while (loopCount < maxLoopCount)` 这一个条件。
+
+两个值得知道的细节：
+
+- 尾部预告块是**每轮重建**，不是原位修改。工具轮会在它之后追加 assistant/tool/观察消息，原位修改会让旧副本沉进历史中间 —— 既白烧 context，又出现互相矛盾的「还剩几轮」。
+- 硬收口文案刻意写「接近轮次上限」而不是「这是你的最后一轮」。提前 3 轮注入时后者是假的，而被告知「还剩一轮」的模型可能继续调用工具。
+
+**`loopCapped` 的语义是「被截断」，不是「跑得久」。** 只有模型在最后一轮**仍在调用工具**被强收口时才置位；恰好在最后一个允许轮次**正常收工**的 run 属于正常完成，**不会**被标记。这个区分很重要：任务守卫（§5.2）会对 loop cap 的任务判失败而跳过结构化提炼阶段，两者混为一谈曾导致完整产出被丢弃 —— 一个以 `status=empty, stopReason=POOL_EXHAUSTED` 收尾的 run，整份结构化结论被替换成了 `{"error": "run loop limit reached"}`。
+
+#### 3.1b 单轮 LLM 重试
+
+某轮出错且**本次尝试既无输出、也无工具调用**时，会在原地重试，最多 `runner.llm-turn-max-retries` 次（默认 3），采用**指数退避**（1s → 2s → 4s，封顶 8s）。一旦该轮已产出部分文本或已发出工具调用则不重试，避免重复副作用。
+
+此前是「固定 `sleep(1s)` + 1 次重试」，面对会突发连续失败的服务商反而有害：固定退避会在同一秒再次命中，把一次抖动放大成连续失败；而 2 次尝试也不够 —— 线上出现过 9 秒内连撞 3 次即耗尽预算的任务挂掉，只有一个恰好只撞 2 次的活了下来。目前尚未做「可重试/不可重试」分类，因此永久性错误（上下文超限 400、鉴权失败）也会被重试；等供应商错误已落库（§4.2.2）后可以做得更精确。
 
 ### 3.2 多级记忆体系 (Memory System)
 
@@ -286,7 +336,7 @@ budget = maxInputTokens × budget-ratio (默认 0.7)
 
 ### 3.6 超时与取消链
 
-停止/取消为 **session 级**：`POST /api/v1/runtime/{sessionId}/stop` 停止该会话当前 run，与请求落到哪个后端副本无关，**无需 runId**。取消标志存于 Redis（`runtime:cancel-session:{sessionId}`），`SessionRunner` 循环在各取消检查点（循环顶部、每轮结束、工具 fiber 前/中/后、LLM 轮次）检测并终止 run，发布取消终态事件。同一端点也会取消停车态（`AWAITING_USER`）run（并解除待处理澄清）。
+停止/取消为 **session 级**：`POST /api/v1/runtime/{sessionId}/stop` 停止该会话当前 run，与请求落到哪个后端副本无关，**无需 runId**。取消标志存于 Redis（`runtime:cancel-session:{sessionId}`），`SessionRunner` 循环在各取消检查点（循环顶部、每轮结束、工具 fiber 前/中/后、LLM 轮次）检测并终止 run，发布取消终态事件。同一端点也会取消**停车态** run —— `AWAITING_USER`（解除待处理澄清）与 `WAITING`（取消未唤醒的等待记录）两者都算。停车态的循环已经退出，因此停止必须**直接写终态**，只设取消标志不行：标志没有消费者。
 
 ![超时与取消链](agent-sphere-readme/timeout-cancel-chain.png)
 
@@ -335,6 +385,48 @@ AgentSphere 支持 **用户澄清（User Clarification）** 机制，使 LLM 在
 | `clarification_expired` | 30 分钟 TTL 到期 | 卡片变灰 |
 | `clarification_dismissed` | 等待时 run 被取消 | 卡片显示已撤销 |
 
+### 3.8a wait 工具（挂起 — 恢复）
+
+`wait`（`builtin_10`）是一个**不阻塞**的内置工具。工具体只写一条 `agent_pending_wait` 记录并立即返回 `{"status":"waiting"}`；`SessionRunner` 随即跳出循环，run 进入停车态 `WAITING`，到点后恢复原 run。
+
+**为什么挂起而不是 sleep。** 常规工具必须在一个 `tool.execution-timeout`（60s）的盒子里跑完，所以「等超过 60s」根本不可满足。挂起把等待放到那个盒子**之外**：不占虚拟线程、不占 `maxParallel` 信号量、不受工具/步骤超时约束。`FiberSet` 一行都不用改 —— 挂起判定完全活在循环之外，这正是 `ask_clarification` 已经证明过的。
+
+**如何告知模型。** 唤醒并不保证，因此工具描述强制模型醒来先用 `getContent` 复核，并禁止重复同一次 wait —— 沿用 `getContent(mode=ready)` 那套「等完必须复核」的要求。
+
+| 属性 | 取值 |
+|---|---|
+| 记录状态流转 | `PENDING` → `RESUMED`（已抢占）/ `CANCELLED` / `FAILED` |
+| 时长边界 | 夹到 `MIN_WAIT_MS = 100` … `MAX_WAIT_MS = 600000`（10 分钟） |
+| 唤醒路径 1 | `PendingWaitWakeScheduler` —— 每条记录一个内存定时器 |
+| 唤醒路径 2 | `WaitWakeTask` —— 每 10s cron，Redisson 锁 `scheduler:pending-wait`（副本重启会丢光内存定时器） |
+| 兜底 | `WaitingRunReconciler` —— 扫描超过 `wait.reconcile-stale-minutes` 仍 `WAITING` 的 run |
+| 恢复重试 | 最多 `MAX_RESUME_ATTEMPTS = 5` 次 |
+
+**两条唤醒路径都用单条条件 `UPDATE ... WHERE status='PENDING'` 抢占**，绝不「先 select 再 update」—— 没有 CAS 时，定时器与 cron 同时命中会把同一个 run 恢复两次。CAS 同时也逼出了失败路径：记录一旦置为 `RESUMED`，`listDue` 与 `claimForResume` 就再也不会捞它，因此恢复时抛异常会让 run 永久卡在 `WAITING`。所以 `resumeFromWait` 不吞异常，而是返回 `ResumeOutcome`（`RESUMED` / `SKIPPED` / `ERROR`）交给调用方决策：`ERROR` 把记录回置 `PENDING` 并 `attempts+1`、同时记 `last_error`；重试预算耗尽则置 `FAILED` 并给 run 发终态事件，避免前端永远停在「执行中」。
+
+两个容易踩错的边界：
+
+- **`asyncHandleUserMessage` 一返回就等于恢复已提交** —— 此后任何失败都不得把 run 退回 `WAITING`。退回会让记录重回 `PENDING`，被 cron 再次抢占并**再提交一个并发循环**。提交**之前**的失败则必须回退，否则 run 卡在 `RUNNING` 却无循环推进，之后每次重试都会被误判成 `SKIPPED`。
+- 补记工具成功的那个事件是 best-effort：自己吞异常，绝不能让恢复失败。
+
+`WAITING` 是一个真正的 run 状态，因此贯穿整套状态机 —— run 行、`run_waiting` SSE 事件、前端、停止按钮与会话清理守卫。两处刻意的非对称：`WAITING` 在前端的**拉取触发**集合里（面板会刷新成「等待中」）但**不在**终态集合里（输入框保持锁定）；停止按钮必须直接置终态而不是只设取消标志 —— 停车态的循环已退出，没有人会消费那个标志。子 Agent 的工具集必须剔除 `wait` —— 挂起判定只在主循环有，放行会造出无人认领的挂起记录。
+
+### 3.8b 待办计划与技能关联
+
+**待办列表是计划的唯一载体**，由模型通过 `todowrite` 工具维护并落库到 `agent_session_todo`。**读技能是纯读，绝不改动待办。**（早期实现曾在 `get` 时从技能播种待办，已删除：它在「只是看一眼技能」时就替换掉模型自己建的计划，而且是不可见的副作用。）
+
+`todowrite` 是**整体替换** —— 模型每次必须回传完整清单，否则先删后插的实现会把漏传的条目悄悄删掉。
+
+| 场景 | 行为 |
+|---|---|
+| 无技能 | 模型自建计划。 |
+| 技能即整份计划 | 按 `## stepN` / `### stepN.M` 铺成 `N. <标题>` / `N.M <标题>`。 |
+| 技能只是某几步的方法 | **保留原计划**，只回填来源字段。 |
+
+每条待办携带**结构化**的来源指针而非文本链接：`skillId` + `stepId`（V84，`agent_session_todo.skill_id` / `step_id`，`stepId` 存标题里的原始标识）。模型执行该条目时用 `skill_library(action=get, skillId=…, sectionHeading=stepId)` 回查正文 —— 标题匹配是不区分大小写的子串匹配，请求 H2 段会连带返回其 H3 子项。子 Agent 继承完整工具集与父级模型路由，可选 `agentRef=instance:<id>` 为其 system prompt 加前缀。
+
+涉及多个技能时**无需聚合**：每条待办自带来源指针，不再有需要保持同步的「当前技能」。
+
 ### 3.9 delegate：多 Agent 委派与 DAG 编排
 
 ![多 Agent DAG 编排（delegate）](agent-sphere-readme/delegate-dag-orchestration.png)
@@ -380,22 +472,22 @@ AgentSphere 支持 **用户澄清（User Clarification）** 机制，使 LLM 在
 
 ### 4.1 配置说明
 
+以下是最常调整的键，均位于 `buukle.agent.*` 下。**这只是子集** —— 完整参考（`buukle.agent.*` 与 `hri-ai.*` 的每一个键，含 `wait`、`mcp`、`audit`、`crypto`、`lock`、`delegate` 以及 web-fetch/Jina 调优块）见 **[CONFIG_REFERENCE-cn.md](CONFIG_REFERENCE-cn.md)**，以它为准。
+
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
 | `session.idle-timeout` | 30m | 会话空闲超时 |
 | `session.max-concurrent-runs` | 10 | 最大并发执行数 |
-| `runner.max-loop-count` | 128 | 单次 run 最大循环次数 |
-| `runner.max-screenshots-per-run` | 20 | 单 run 注入模型上下文的截图观察次数上限 |
+| `runner.max-loop-count` | 128 | 单次 run 最大循环次数（§3.1a） |
+| `runner.task-max-loop-count` | 2000 | 任务触发 run 的更高轮次上限（§3.1a） |
 | `runner.turn-timeout` | 180s | 单轮 LLM 调用超时 |
+| `runner.llm-turn-max-retries` | 3 | 单轮重试次数，指数退避（§3.1b） |
 | `runner.compaction.budget-ratio` | 0.7 | 压缩触发阈值（maxInputTokens 比例） |
-| `llm.connect-timeout` | 30s | LLM API 连接超时 |
-| `llm.read-timeout` | 60s | LLM API 读取超时 |
 | `llm.stream-timeout` | 120s | 流式调用总超时 |
 | `tool.max-parallel` | 3 | 工具最大并行数 |
-| `tool.execution-timeout` | 60s | 单批工具执行超时 |
-| `tool.submit-timeout` | 30s | 工具提交超时 |
 | `distributed.owner-lease` | 5m | 会话执行者 owner 租约（多副本接管） |
 | `distributed.orphan-sweep-interval` | 30s | 孤儿 run 清扫间隔（租约过期 → FAILED → 续跑） |
+| `hri-ai.tasks.min-timeout-seconds` | 10800 | 任务超时下限 3h（§5.2） |
 
 ### 4.2 可观测性 (Observability)
 
@@ -425,6 +517,7 @@ reasoning_token   → "🤔 用户问天气，我需要打开天气网站"
 | `run_failed` | Run 失败 | 错误提示 |
 | `run_cancelled` | Run 被取消 | 取消提示 |
 | `run_awaiting_user` | Run 暂停等待澄清 | 置为 AWAITING_USER |
+| `run_waiting` | Run 因 `wait` 工具停车 | 置为 WAITING（到点自动恢复） |
 | `tool_call_started` | 工具 PENDING | 工具调用列表 |
 | `tool_call_in_progress` | 工具执行中 | 运行图标 |
 | `tool_call_succeeded` | 工具完成 | ✅ 图标 |
@@ -477,6 +570,14 @@ Run 交互（列表视图）：
 Run 交互详情：
 
 ![Run 交互详情](agent-sphere-readme/Interactions-of-run-detail.png)
+
+**run 为什么失败会被落库**（`agent_run.error_message`，V87）。所有 FAILED 发布方本来就把原因放进了事件 —— 单轮 LLM 失败、提交期校验/上下文准备失败、孤儿清扫、以及卡住 `WAITING` 的抢救 —— 因此 `RuntimeEventListener` 的 `FAILED` 分支是唯一的落库收口点。此前该分支只写 status、把事件里的 `errorMessage` 丢弃，而表上又没有对应列，于是失败的 run **不留任何原因**。
+
+**排查口径** —— 交互记录表是另一半线索，但很容易误读：
+
+- 模型端**秒回错误**的特征是 `CHAT_REPLY` 行上 `prompt_tokens IS NULL AND duration_ms < 1000`。线上整批上游故障就是这样被识别出来的。
+- `response_body = '{}'` **不是**错误信号。模型只回 tool call、不回正文的一轮，响应体天然为空，这属正常轮次。
+- 供应商错误以**事件**而非异常形式到达，所以 `success` 曾经对「真正打挂 run 的那类失败」也保持 `true`。现在 `KernelLlmService` 会把事件错误一并记录，同时把对应的助手 timeline 行翻成失败。这是有意为之 —— 那一轮确实失败了，哪怕后续重试把 run 救了回来。
 
 #### 4.2.3 会话面板 (Session Panel)
 
@@ -791,6 +892,20 @@ node agent-sphere/local-dev/mock-oidc-server.mjs      # 监听 :9000
 
 RSA 密钥刻意固定不变，保证后端缓存的 JWKS 每次重启仍可验签 id_token（避免 `S0006`）。把 `agent_identity_provider` 行指向它（`code=bole`、`issuer=http://localhost:9000`、端点位于 `/oauth2/...`、`jwks_url=http://localhost:9000/jwks`、scopes `openid email profile`、enabled）。
 
+### 4.14 会话数据清理（磁盘回收）
+
+`agent_session_cleanup_run` 记录一个定时任务（`SessionCleanupTask`），它**硬删除**过期会话数据，阻止数据库持续膨胀。这是「绝不硬删」这一约定的唯一豁免：`agent_llm_interaction_record` 保存了完整的请求/响应/推理文本，逻辑删除（`delete_flag`）会把每一个字节都留在磁盘上。因此清理 SQL **刻意绕过 MyBatis-Plus**，并且**刻意不过滤 `delete_flag`** —— 已被逻辑删除的行同样占空间。
+
+**过期的判定** —— `会话.created_at < cutoff AND 会话.updated_at < cutoff`，外加两个 `NOT EXISTS` 守卫，排除存在 `PENDING`/`RUNNING` run 与 `QUEUED`/`RUNNING` task 的会话，避免把正在执行的会话从脚下删掉。长任务只会更新 `task`/`run` 行、从不更新会话行，所以「时间到了」本身不是充分信号。`AWAITING_USER` 刻意**不**设守卫 —— 一个永远无人应答的澄清会让清理无限期卡住。停车态 `WAITING` 则纳入守卫。
+
+**删除顺序是外键契约。** 全库只有两个真实外键且都没有级联（`agent_run.session_id → agent_session`、`agent_task_artifact.task_id → agent_task`）；mapper 的方法顺序**就是**执行顺序，并有单测用 `InOrder` 锁住。调换顺序会让生产报 `violates foreign key constraint`。
+
+**每一轮都会记录。** cron 与手动端点都会往 `agent_session_cleanup_run` 写一行，且 RUNNING 行是在**取锁之前**插入的 —— 因此「没抢到锁」和「开关关闭」也会留下痕迹（`status=SKIPPED` 加 `skip_reason`）；否则没人能解释磁盘为什么没瘦下来。终态为 `SUCCESS`（带各表 `table_stats`）、`SKIPPED`、`FAILED`（带 `error_message`，且异常仍会抛出）。预演同样会记录 —— 不可逆的删除需要审计轨迹。该记录表会在任务最后阶段自我裁剪。
+
+**手动触发是异步的**：`POST /api/v1/instance/session-cleanup` 只负责**提交** —— 它在请求线程上插入 RUNNING 记录后立即返回，实际工作跑在 `runtimeAsyncExecutor` 上，因为一轮可能覆盖 200×50 个会话。用 `GET /api/v1/instance/session-cleanup/runs`（及 `/runs/{id}`）轮询进度与结果；接口会用 `finished_at` 计算 `stale` 标记，避免把崩溃进程遗留的僵尸 RUNNING 行误认为正在清理。**`dryRun` 默认为 `true`** —— 必须在请求体显式传 `"dryRun": false` 才会真正落刀。
+
+保留天数与开关放在 `agent_system_config`（`config_group='session'`），改配置无需重新部署；cron、批大小与休眠间隔则放在 `application.yml` 的 `buukle.agent.session` 下。与技能同步任务一样，因为 `replicas: 2`，该任务会取 Redisson 锁（`scheduler:session-cleanup`）。注意硬删只是把空间释放给 **PostgreSQL 内部复用**，磁盘文件大小不变，所以任务只打印 `VACUUM (FULL, ANALYZE)` 提示而不执行（那会取 ACCESS EXCLUSIVE 锁）。
+
 ---
 
 ## 5. 能力开放（外部接入）
@@ -848,9 +963,23 @@ curl -X POST "http://localhost:8080/api/v1/api/tasks/7/stop?code=business&subjec
 
 响应为 `TaskVO`（`id`、`status` `QUEUED/RUNNING/COMPLETED/FAILED/CANCELLED`、`sessionId`、`runId`、`resultJson` 等）。配置 `callbackUrl` 时后端会把任务进度/最终结果 POST 回去。完成的任务会把两阶段提炼的结构化输出落为**任务产物**（见下）。
 
+**任务阶段。** 任务按 `execute` → `extract` → `refine` 推进，记录在 `poll_phase`：
+
+1. **`execute`** —— 真正干活的 run。它到 `COMPLETED` 后 poller 才继续；若它是被**循环上限截断**的（`loop_capped`），则任务直接判失败并跳过提炼 —— 半成品不允许冒充完成。该失败路径仍会带回 run 自身的产出（外加一句人话 `remark`），让调用方看得到模型实际交付了什么。
+2. **`extract`** —— 第二个 run 把会话重排成 `expectedOutput` 的 JSON Schema。输出会按契约校验；不通过则进入 `refine`。
+3. **`refine`** —— 带校验错误修正一轮。仍不通过则原样返回最后一次输出，而不是无限重试。
+
+每份产物连同产出它的阶段一起存入 `agent_task_artifact`。
+
+**超时。** 生效超时 = `max(taskTimeoutSeconds, hri-ai.tasks.min-timeout-seconds)`；调用方未传 `taskTimeoutSeconds` 时回落 `hri-ai.tasks.max-poll-seconds`（3600s）；下限默认 0（不启用）。超时即判 `task poll timeout` 失败。
+
+**下限之所以存在，是因为单改默认值在实践中毫无效果**：每个任务都带自己的 `task_timeout_seconds`，而调用方几乎一律显式传 3600 —— 抬高 `max-poll-seconds` 只会影响那些省略该字段的任务。`min-timeout-seconds` 是唯一能在不动调用方的前提下抬高真实超时的位置。默认 **10800s（3h）**，依据实测耗时分布选定（均值 838s、最大 9818s、无一超过 3h）。代价是服务端会覆盖调用方显式传的值，这是刻意的。
+
+同一个解析结果同时决定**任务级 MCP 凭证 TTL**（`超时 + 15 分钟`）—— 刻意共用一个 chokepoint，凭证因此绝不会早于它所属的任务过期。
+
 ### 5.3 任务产物（Task Artifact）
 
-两阶段提炼结果存储于 `agent_task_artifact`，管理端接口：
+`extract` / `refine` 两个阶段（§5.2）的提炼结果存储于 `agent_task_artifact` —— 每行记录是哪个阶段产出的 —— 管理端接口：
 
 - `GET /api/v1/admin/task-artifacts` —— 分页列表（`keyword`、`taskId`、`page`、`size`），权限 `admin:tasks:read`，按 `created_by` 行级隔离。
 - `GET /api/v1/admin/task-artifacts/{id}` —— 详情，含完整 `content` JSON 与 `schemaRef`。
