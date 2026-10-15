@@ -24,6 +24,8 @@ import java.util.List;
 @RequiredArgsConstructor
 public class PendingWaitService implements PendingWaitSpi {
 
+    private static final int ERROR_MAX = 500;
+
     private final AgentPendingWaitMapper waitMapper;
     private final ApplicationEventPublisher eventPublisher;
 
@@ -39,6 +41,7 @@ public class PendingWaitService implements PendingWaitSpi {
         entity.setWaitMs(bounded);
         entity.setWakeAt(LocalDateTime.ofInstant(wakeAt, ZoneId.systemDefault()));
         entity.setStatus(WaitConstants.PENDING_STATUS);
+        entity.setAttempts(0);
         waitMapper.insert(entity);
 
         log.info("Pending wait created: id={} runId={} callId={} waitMs={} wakeAt={}",
@@ -64,14 +67,42 @@ public class PendingWaitService implements PendingWaitSpi {
     }
 
     @Override
+    public int requeueForRetry(Long waitId, String error) {
+        if (waitId == null) {
+            return -1;
+        }
+        AgentPendingWait p = waitMapper.selectById(waitId);
+        if (p == null || !WaitConstants.RESUMED_STATUS.equals(p.getStatus())) {
+            return -1;
+        }
+        int attempts = (p.getAttempts() == null ? 0 : p.getAttempts()) + 1;
+        // RESUMED → PENDING：让 cron（listDue/claimForResume 只认 PENDING）能再次尝试。
+        int updated = waitMapper.update(null, new LambdaUpdateWrapper<AgentPendingWait>()
+                .eq(AgentPendingWait::getId, waitId)
+                .eq(AgentPendingWait::getStatus, WaitConstants.RESUMED_STATUS)
+                .set(AgentPendingWait::getStatus, WaitConstants.PENDING_STATUS)
+                .set(AgentPendingWait::getAttempts, attempts)
+                .set(AgentPendingWait::getLastError, truncate(error)));
+        return updated > 0 ? attempts : -1;
+    }
+
+    @Override
+    public void markTerminal(Long waitId, String status, String error) {
+        if (waitId == null) {
+            return;
+        }
+        waitMapper.update(null, new LambdaUpdateWrapper<AgentPendingWait>()
+                .eq(AgentPendingWait::getId, waitId)
+                .set(AgentPendingWait::getStatus, status)
+                .set(AgentPendingWait::getLastError, truncate(error)));
+    }
+
+    @Override
     public PendingWaitVO getById(Long waitId) {
         if (waitId == null) {
             return null;
         }
-        AgentPendingWait p = waitMapper.selectById(waitId);
-        return p == null ? null : new PendingWaitVO(
-                p.getId(), p.getSessionId(), p.getRunId(), p.getCallId(),
-                p.getWaitMs(), p.getWakeAt(), p.getStatus());
+        return toVO(waitMapper.selectById(waitId));
     }
 
     @Override
@@ -88,7 +119,8 @@ public class PendingWaitService implements PendingWaitSpi {
     }
 
     @Override
-    public List<PendingWaitVO> listDue(Duration overdueBy, int limit) {        LocalDateTime cutoff = LocalDateTime.ofInstant(
+    public List<PendingWaitVO> listDue(Duration overdueBy, int limit) {
+        LocalDateTime cutoff = LocalDateTime.ofInstant(
                 Instant.now().minus(overdueBy), ZoneId.systemDefault());
         List<AgentPendingWait> rows = waitMapper.selectList(
                 new LambdaQueryWrapper<AgentPendingWait>()
@@ -96,8 +128,31 @@ public class PendingWaitService implements PendingWaitSpi {
                         .le(AgentPendingWait::getWakeAt, cutoff)
                         .orderByAsc(AgentPendingWait::getWakeAt)
                         .last("LIMIT " + Math.max(1, limit)));
-        return rows.stream().map(p -> new PendingWaitVO(
+        return rows.stream().map(this::toVO).toList();
+    }
+
+    @Override
+    public List<PendingWaitVO> listPendingByRunId(Long runId) {
+        if (runId == null) {
+            return List.of();
+        }
+        return waitMapper.selectList(new LambdaQueryWrapper<AgentPendingWait>()
+                        .eq(AgentPendingWait::getRunId, runId)
+                        .eq(AgentPendingWait::getStatus, WaitConstants.PENDING_STATUS)
+                        .orderByDesc(AgentPendingWait::getId))
+                .stream().map(this::toVO).toList();
+    }
+
+    private PendingWaitVO toVO(AgentPendingWait p) {
+        return p == null ? null : new PendingWaitVO(
                 p.getId(), p.getSessionId(), p.getRunId(), p.getCallId(),
-                p.getWaitMs(), p.getWakeAt(), p.getStatus())).toList();
+                p.getWaitMs(), p.getWakeAt(), p.getStatus(), p.getAttempts());
+    }
+
+    private static String truncate(String s) {
+        if (s == null) {
+            return null;
+        }
+        return s.length() > ERROR_MAX ? s.substring(0, ERROR_MAX) : s;
     }
 }

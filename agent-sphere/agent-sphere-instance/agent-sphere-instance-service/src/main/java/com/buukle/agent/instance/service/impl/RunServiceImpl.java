@@ -21,6 +21,8 @@ import com.buukle.agent.runtime.kernel.constants.ChatClarification;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 
+import java.time.LocalDateTime;
+
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
@@ -67,6 +69,20 @@ public class RunServiceImpl extends ServiceImpl<RunMapper, AgentRun> implements 
                 .last("LIMIT 1")
                 .one();
         return run == null ? null : runConverter.toVO(run);
+    }
+
+    @Override
+    public List<RunVO> findStaleByStatus(String status, LocalDateTime olderThan, int limit) {
+        if (status == null || olderThan == null) {
+            return List.of();
+        }
+        return lambdaQuery()
+                .eq(AgentRun::getStatus, status)
+                .lt(AgentRun::getUpdatedAt, olderThan)
+                .orderByAsc(AgentRun::getId)
+                .last("LIMIT " + Math.max(1, limit))
+                .list()
+                .stream().map(runConverter::toVO).toList();
     }
 
     @Override

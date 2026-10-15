@@ -142,47 +142,132 @@ public class ChatRuntimeService {
      * <p>调用方必须已用 {@code PendingWaitSpi#claimForResume} 抢占成功 —— 内存定时器与
      * cron 补偿会同时命中同一条记录，没有抢占就会把同一个 run 恢复两次。
      */
-    public void resumeFromWait(PendingWaitVO wait) {
+    /** wait 唤醒结果，供唤醒路径决定"完成 / 终态化 / 回置重试"。 */
+    public enum ResumeOutcome { RESUMED, SKIPPED, ERROR }
+
+    /**
+     * wait 等待到期：把那次 wait 的工具结果补成「已等待」，并恢复原 run。
+     *
+     * <p><b>不再吞异常</b>：返回 {@link ResumeOutcome}，由调用方决定失败时回置 PENDING 重试
+     * （见 {@code requeueForRetry}）—— 否则「claim 后恢复失败」会永久卡 WAITING。
+     *
+     * <p>调用方必须已用 {@code PendingWaitSpi#claimForResume} 抢占成功。
+     */
+    public ResumeOutcome resumeFromWait(PendingWaitVO wait) {
         Long sessionId = wait.getSessionId();
         Long runId = wait.getRunId();
-        String callId = wait.getCallId();
+        try {
+            RunVO run = runSpi.getRun(runId);
+            if (run == null) {
+                log.warn("Wait resume skipped: run {} no longer exists", runId);
+                return ResumeOutcome.SKIPPED;
+            }
+            if (!RunStatus.WAITING.name().equals(run.getStatus())) {
+                // 已被取消/收口，或已被另一条路径唤醒：无从恢复，交给调用方终态化
+                log.info("Wait resume skipped: runId={} status={} (expected {})", runId, run.getStatus(), RunStatus.WAITING);
+                return ResumeOutcome.SKIPPED;
+            }
+            run.setStatus(RunStatus.RUNNING.name());
+            runSpi.updateRun(run);
 
-        // 补齐 wait 那条 tool call 的结果：模型恢复后由 HistoryLoader 读到它，
-        // 看到的是「已等待 N 秒」而不是悬空的 {"status":"waiting"}。
-        // 走事件而非直接改库：RuntimeEventListener 的 SUCCEEDED 分支会一并
-        // updateStatus/updateCompressedArtifact + 收 timeline 行 + 广播前端，一次事件全做完。
-        if (callId != null && !callId.isBlank()) {
-            String artifact = "{\"status\":\"waiting\",\"elapsed_ms\":" + wait.getWaitMs() + ",\"resumed_at\":\""
-                    + java.time.LocalDateTime.now() + "\"}";
-            eventPublisher.publishEvent(new RuntimeEventVO(ToolCallStatus.SUCCEEDED,
-                    new RuntimeEventDataVO()
-                            .setSessionId(sessionId)
-                            .setRunId(runId)
-                            .setToolName(WaitConstants.TOOL_NAME)
-                            .setDisplayNameCn(WaitConstants.DISPLAY_NAME_CN)
-                            .setDisplayNameEn(WaitConstants.DISPLAY_NAME)
-                            .setArtifact(artifact)
-                            .setPublishId(RuntimeEventTypeConstant.PUBLISH_ID_TOOL + callId)));
+            // 恢复线程（定时器/cron）无租户上下文：补 username 供审计/归属。
+            // 刻意不设 TenantUtil —— DataPermissionInterceptor 用租户当 created_by 过滤，
+            // 设了反而可能把系统表（模型/实例）行滤掉。
+            String createdBy = run.getCreatedBy();
+            boolean ctx = createdBy != null && !createdBy.isBlank();
+            if (ctx) AuthContext.setUsername(createdBy);
+            try {
+                sessionSpi.touchSession(sessionId);
+                orchestrator.asyncHandleUserMessage(run, sessionId,
+                        WaitConstants.WAIT_RESUME_PREFIX + wait.getWaitMs() + "ms elapsed.", null, true, List.of());
+            } finally {
+                if (ctx) AuthContext.clear();
+            }
+
+            // 恢复已提交后才补 wait 那条 tool call 的结果（避免"工具已记成功但 run 没恢复"）。
+            if (wait.getCallId() != null && !wait.getCallId().isBlank()) {
+                String artifact = "{\"status\":\"waiting\",\"elapsed_ms\":" + wait.getWaitMs()
+                        + ",\"resumed_at\":\"" + java.time.LocalDateTime.now() + "\"}";
+                eventPublisher.publishEvent(new RuntimeEventVO(ToolCallStatus.SUCCEEDED,
+                        new RuntimeEventDataVO()
+                                .setSessionId(sessionId)
+                                .setRunId(runId)
+                                .setToolName(WaitConstants.TOOL_NAME)
+                                .setDisplayNameCn(WaitConstants.DISPLAY_NAME_CN)
+                                .setDisplayNameEn(WaitConstants.DISPLAY_NAME)
+                                .setArtifact(artifact)
+                                .setPublishId(RuntimeEventTypeConstant.PUBLISH_ID_TOOL + wait.getCallId())));
+            }
+            log.info("Wait resumed: waitId={} runId={} sessionId={} waitedMs={}",
+                    wait.getId(), runId, sessionId, wait.getWaitMs());
+            return ResumeOutcome.RESUMED;
+        } catch (Exception e) {
+            log.warn("Wait resume failed: waitId={} runId={}", wait.getId(), runId, e);
+            rollbackToWaiting(runId);
+            return ResumeOutcome.ERROR;
         }
+    }
 
+    /**
+     * 恢复失败时把 run 改回 WAITING。
+     *
+     * <p>{@code resumeFromWait} 先把 run 置 RUNNING 再提交异步续跑；一旦后面抛异常，
+     * run 就停在 RUNNING 却没有任何 loop 在跑。下一次重试会因状态不是 WAITING 被判 SKIPPED，
+     * {@code failStuckWait} 也因状态不匹配直接返回 —— 结果是 run 既没恢复也没失败，
+     * 永久停在「执行中」。所以失败路径必须自己把状态退回去。
+     */
+    private void rollbackToWaiting(Long runId) {
+        try {
+            RunVO run = runSpi.getRun(runId);
+            if (run == null || !RunStatus.RUNNING.name().equals(run.getStatus())) {
+                return;
+            }
+            run.setStatus(RunStatus.WAITING.name());
+            runSpi.updateRun(run);
+        } catch (Exception e) {
+            log.warn("Wait resume rollback failed: runId={}", runId, e);
+        }
+    }
+
+    /**
+     * 把一条卡住的 WAITING run 置 FAILED 并发终态事件（重试超限 / 对账抢救失败时调用），
+     * 避免前端永久停在「执行中」。
+     */
+    public void failStuckWait(Long sessionId, Long runId, String reason) {
         RunVO run = runSpi.getRun(runId);
-        if (run == null) {
-            log.warn("Wait wake skipped: run {} no longer exists", runId);
+        if (run == null || !RunStatus.WAITING.name().equals(run.getStatus())) {
             return;
         }
-        if (!RunStatus.WAITING.name().equals(run.getStatus())) {
-            // 已被取消/收口，或已被另一条路径唤醒：不再重复推进
-            log.info("Wait wake skipped: runId={} status={} (expected {})", runId, run.getStatus(), RunStatus.WAITING);
-            return;
-        }
-        run.setStatus(RunStatus.RUNNING.name());
+        run.setStatus(RunStatus.FAILED.name());
         runSpi.updateRun(run);
+        eventPublisher.publishEvent(new RuntimeEventVO(RunStatus.FAILED,
+                new RuntimeEventDataVO()
+                        .setSessionId(sessionId)
+                        .setRunId(runId)
+                        .setAssistantReply("等待恢复失败：" + reason)
+                        .setPublishId(RuntimeEventTypeConstant.PUBLISH_ID_RUN + runId)));
+    }
 
-        sessionSpi.touchSession(sessionId);
-        orchestrator.asyncHandleUserMessage(run, sessionId,
-                WaitConstants.WAIT_RESUME_PREFIX + wait.getWaitMs() + "ms elapsed.", null, true, List.of());
-        log.info("Wait resumed: waitId={} runId={} sessionId={} waitedMs={}",
-                wait.getId(), runId, sessionId, wait.getWaitMs());
+    /**
+     * 处理一次唤醒结果：<b>claim 之后绝不让记录停在 RESUMED</b>。
+     * SKIPPED → 终态化 CANCELLED；ERROR → 回置 PENDING 重试，超限则置 FAILED 并把卡住的 run 置终态。
+     */
+    public void onResumeOutcome(PendingWaitVO wait, ResumeOutcome outcome) {
+        if (outcome == ResumeOutcome.RESUMED) {
+            return;
+        }
+        if (outcome == ResumeOutcome.SKIPPED) {
+            pendingWaitSpi.markTerminal(wait.getId(), WaitConstants.CANCELLED_STATUS, "run not waiting");
+            return;
+        }
+        int attempts = pendingWaitSpi.requeueForRetry(wait.getId(), "resume error");
+        if (attempts < 0 || attempts >= WaitConstants.MAX_RESUME_ATTEMPTS) {
+            pendingWaitSpi.markTerminal(wait.getId(), WaitConstants.FAILED_STATUS, "resume failed after retries");
+            failStuckWait(wait.getSessionId(), wait.getRunId(),
+                    "wait resume failed after " + Math.max(attempts, 0) + " attempt(s)");
+        } else {
+            log.info("Wait requeued for retry: waitId={} attempts={}", wait.getId(), attempts);
+        }
     }
 
     public ChatMessageResponseVO resumeFromClarification(Long sessionId, Long runId, String response, String clarificationId) {

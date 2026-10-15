@@ -58,6 +58,15 @@
         <appender-ref ref="FILE" />
     </logger>
 
+    <!-- wait 挂起-恢复的三条后台路径（内存定时器 / cron 补偿 / 超时对账）没有任何请求线程的
+         日志做现场，唤醒失败又会静默卡死 run（claim 已把记录改成 RESUMED，listDue 不再捞）。
+         这里钉住整个 wait 包为 INFO，避免后续有人把 com.buukle 调到 WARN 时把唯一的排查线索一起压掉。
+         父 logger 显式 additivity="false" 时必须自带 appender-ref，否则日志不落盘。 -->
+    <logger name="com.buukle.agent.runtime.orchestration.wait" level="INFO" additivity="false">
+        <appender-ref ref="CONSOLE" />
+        <appender-ref ref="FILE" />
+    </logger>
+
     <logger name="org.apache.catalina.connector.CoyoteAdapter" level="WARN" additivity="false">
         <appender-ref ref="CONSOLE" />
         <appender-ref ref="FILE" />

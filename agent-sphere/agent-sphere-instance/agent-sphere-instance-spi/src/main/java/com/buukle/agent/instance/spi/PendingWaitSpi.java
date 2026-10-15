@@ -42,4 +42,21 @@ public interface PendingWaitSpi {
      * @return 被取消的记录数
      */
     int cancelPendingByRunId(Long runId);
+
+    /**
+     * 恢复失败后回置为 PENDING 以便重试：仅当记录处于 RESUMED 时生效，attempts +1、记 last_error。
+     *
+     * <p>唤醒是「先 CAS 置 RESUMED、再真正恢复」；一旦恢复抛异常，记录若停在 RESUMED，
+     * {@link #listDue}/{@link #claimForResume} 只认 PENDING → cron 永不重试 → run 永久卡 WAITING。
+     * 因此失败必须回置 PENDING（本方法）。
+     *
+     * @return 回置后的 attempts；回置失败（记录非 RESUMED）返回 -1
+     */
+    int requeueForRetry(Long waitId, String error);
+
+    /** 终态化一条等待记录（CANCELLED / FAILED），记录原因。 */
+    void markTerminal(Long waitId, String status, String error);
+
+    /** 取某 run 名下仍 PENDING 的挂起记录（对账用；至多一条）。 */
+    List<PendingWaitVO> listPendingByRunId(Long runId);
 }

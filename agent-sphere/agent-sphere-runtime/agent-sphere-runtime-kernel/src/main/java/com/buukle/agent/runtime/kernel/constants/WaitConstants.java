@@ -63,6 +63,11 @@ public final class WaitConstants {
     public static final String RESUMED_STATUS = "RESUMED";
     /** run 被停止时取消挂起：置此状态后，waker（listDue/claimForResume 只认 PENDING）不再恢复该 run。 */
     public static final String CANCELLED_STATUS = "CANCELLED";
+    /** 恢复重试超限：置此状态并发 run 终态事件，避免永久卡 WAITING。 */
+    public static final String FAILED_STATUS = "FAILED";
+
+    /** 单条等待记录的恢复重试上限（cron 每 10s 一轮，约 50s 内重试 5 次）。 */
+    public static final int MAX_RESUME_ATTEMPTS = 5;
 
     private WaitConstants() {
     }

@@ -80,11 +80,24 @@ public class PendingWaitWakeScheduler {
                 log.warn("Wait {} claimed but record missing", waitId);
                 return;
             }
-            chatRuntimeService.resumeFromWait(wait);
+            chatRuntimeService.onResumeOutcome(wait, chatRuntimeService.resumeFromWait(wait));
         } catch (Exception e) {
             log.error("Failed to wake pending wait {}", waitId, e);
+            requeueBestEffort(waitId);
         } finally {
             scheduled.remove(waitId);
+        }
+    }
+
+    /** claim 之后任何异常都要回置 PENDING（best-effort），否则记录停在 RESUMED、cron 不再重试。 */
+    private void requeueBestEffort(Long waitId) {
+        try {
+            PendingWaitVO w = pendingWaitSpi.getById(waitId);
+            if (w != null) {
+                chatRuntimeService.onResumeOutcome(w, ChatRuntimeService.ResumeOutcome.ERROR);
+            }
+        } catch (Exception e) {
+            log.error("Failed to requeue wait {} after wake error", waitId, e);
         }
     }
 

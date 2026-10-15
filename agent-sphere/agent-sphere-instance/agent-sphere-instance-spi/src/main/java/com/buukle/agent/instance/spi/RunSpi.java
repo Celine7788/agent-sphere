@@ -5,6 +5,7 @@ import com.buukle.agent.instance.dtvo.dto.CreateRunDTO;
 import com.buukle.agent.instance.dtvo.vo.MessageHistoryVO;
 import com.buukle.agent.instance.dtvo.vo.RunVO;
 
+import java.time.LocalDateTime;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
@@ -27,4 +28,7 @@ public interface RunSpi {
     Map<Long, String> findReasoningBatch(Collection<Long> runIds);
 
     MessageHistoryVO getMessageHistory(Long sessionId, String direction, Long runId);
+
+    /** 对账用：按状态 + updated_at 早于某时刻查找 run（升序，最多 limit 条）。 */
+    List<RunVO> findStaleByStatus(String status, LocalDateTime olderThan, int limit);
 }

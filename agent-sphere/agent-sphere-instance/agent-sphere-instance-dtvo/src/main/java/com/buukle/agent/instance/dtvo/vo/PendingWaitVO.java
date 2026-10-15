@@ -19,4 +19,6 @@ public class PendingWaitVO implements Serializable {
     private Integer waitMs;
     private LocalDateTime wakeAt;
     private String status;
+    /** 已重试恢复次数（V86）。 */
+    private Integer attempts;
 }

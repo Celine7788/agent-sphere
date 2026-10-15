@@ -157,17 +157,23 @@ public class SessionRunner {
     }
 
     public void run(Long sessionId) {
+        boolean parked = false;
         try {
-            runInternal(sessionId);
+            parked = runInternal(sessionId);
         } finally {
-            // 无论正常/取消/异常退出，都必须清空输入队列/steer：
-            // 协调器据此判断是否还有 pending；异常漏清会导致取消后被误判“还有消息”而重启主循环。
-            inputManager.clear(sessionId);
+            // 停车态退出（WAITING / AWAITING_USER）**不清**输入队列/steer：唤醒的恢复输入可能在
+            // 「退出窗口」内刚落进 Redis，清掉会让恢复后的新循环 promoteInput 取空 → run 空转卡死。
+            // 其余退出（终态/取消/无输入）仍清，避免协调器误判"还有消息"而重启主循环。
+            if (!parked) {
+                inputManager.clear(sessionId);
+            }
             ctxCache().remove(sessionId);
         }
     }
 
-    private void runInternal(Long sessionId) {
+    /** @return 本次是否以「停车态」（WAITING / AWAITING_USER）退出 —— 供 {@link #run} 决定是否清输入。 */
+    private boolean runInternal(Long sessionId) {
+        boolean parked = false;
         Long currentRunId = redissonClient.<Long>getBucket(
                 DistributedRuntimeConstants.sessionPendingRunKey(sessionId)).getAndDelete();
         RunVO currentRun = currentRunId != null ? runSpi.getRun(currentRunId) : null;
@@ -464,6 +470,7 @@ public class SessionRunner {
                 }
             }
             if (suspendStatus != null) {
+                parked = true;
                 currentRun.setStatus(suspendStatus.name());
                 runSpi.updateRun(currentRun);
                 eventPublisher.publishEvent(new RuntimeEventVO(suspendStatus,
@@ -561,6 +568,7 @@ public class SessionRunner {
                             .setAssistantReply(RunnerConstants.CANCEL_MSG)
                             .setPublishId(RuntimeEventTypeConstant.PUBLISH_ID_RUN + currentRunId)));
         }
+        return parked;
     }
 
     /** 达到轮次上限强收口时标记 run（任务守卫据 loopCapped 判失败，避免"半成品"冒充完成）。 */

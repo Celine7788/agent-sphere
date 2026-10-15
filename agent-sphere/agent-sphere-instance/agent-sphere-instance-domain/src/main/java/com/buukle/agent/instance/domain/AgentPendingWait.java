@@ -25,6 +25,10 @@ public class AgentPendingWait {
     private String status;
     private String reason;
     private LocalDateTime resumedAt;
+    /** 恢复重试次数（V86）：每次 requeueForRetry +1，超上限置 FAILED。 */
+    private Integer attempts;
+    /** 最近一次恢复失败原因（V86）。 */
+    private String lastError;
     @TableField(fill = FieldFill.INSERT)
     private String createdBy;
     @TableField(fill = FieldFill.INSERT_UPDATE)

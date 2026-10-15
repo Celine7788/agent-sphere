@@ -124,6 +124,50 @@ class PendingWaitServiceTest {
     }
 
     @Test
+    void requeueForRetry_putsResumedRowBackToPendingAndCountsAttempt() {
+        AgentPendingWait resumed = new AgentPendingWait();
+        resumed.setId(11L);
+        resumed.setStatus(WaitConstants.RESUMED_STATUS);
+        resumed.setAttempts(1);
+        when(waitMapper.selectById(11L)).thenReturn(resumed);
+        when(waitMapper.update(any(), any(LambdaUpdateWrapper.class))).thenReturn(1);
+
+        assertEquals(2, service.requeueForRetry(11L, "boom"));
+
+        // 必须回到 PENDING：listDue / claimForResume 只认 PENDING，停在 RESUMED 就永远没人再捞
+        verify(waitMapper).update(any(), any(LambdaUpdateWrapper.class));
+    }
+
+    @Test
+    void requeueForRetry_returnsMinusOneWhenRowIsNotResumed() {
+        AgentPendingWait pending = new AgentPendingWait();
+        pending.setId(12L);
+        pending.setStatus(WaitConstants.PENDING_STATUS);
+        when(waitMapper.selectById(12L)).thenReturn(pending);
+
+        assertEquals(-1, service.requeueForRetry(12L, "boom"));
+        verify(waitMapper, never()).update(any(), any());
+    }
+
+    @Test
+    void requeueForRetry_ignoresNullId() {
+        assertEquals(-1, service.requeueForRetry(null, "boom"));
+        verify(waitMapper, never()).update(any(), any());
+    }
+
+    @Test
+    void markTerminal_ignoresNullId() {
+        service.markTerminal(null, WaitConstants.FAILED_STATUS, "x");
+        verify(waitMapper, never()).update(any(), any());
+    }
+
+    @Test
+    void listPendingByRunId_ignoresNullRunId() {
+        assertTrue(service.listPendingByRunId(null).isEmpty());
+        verify(waitMapper, never()).selectList(any());
+    }
+
+    @Test
     void listDue_boundsLimitToAtLeastOne() {
         when(waitMapper.selectList(any())).thenReturn(java.util.List.of());
         // limit 传 0 / 负数也不能拼出 "LIMIT 0" 之外的非法 SQL

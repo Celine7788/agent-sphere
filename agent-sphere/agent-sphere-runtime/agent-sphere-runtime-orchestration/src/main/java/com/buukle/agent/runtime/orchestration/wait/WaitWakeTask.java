@@ -64,11 +64,19 @@ public class WaitWakeTask {
                 try {
                     PendingWaitVO claimed = pendingWaitSpi.getById(wait.getId());
                     if (claimed != null) {
-                        chatRuntimeService.resumeFromWait(claimed);
+                        chatRuntimeService.onResumeOutcome(claimed, chatRuntimeService.resumeFromWait(claimed));
                     }
                 } catch (Exception e) {
                     // 单条失败不拖垮整批：其余等待仍应被唤醒
                     log.error("Failed to resume pending wait {}", wait.getId(), e);
+                    try {
+                        PendingWaitVO w = pendingWaitSpi.getById(wait.getId());
+                        if (w != null) {
+                            chatRuntimeService.onResumeOutcome(w, ChatRuntimeService.ResumeOutcome.ERROR);
+                        }
+                    } catch (Exception e2) {
+                        log.error("Failed to requeue pending wait {}", wait.getId(), e2);
+                    }
                 }
             }
         } catch (InterruptedException e) {
