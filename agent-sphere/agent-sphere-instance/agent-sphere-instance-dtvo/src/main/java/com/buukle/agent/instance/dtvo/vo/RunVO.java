@@ -31,6 +31,10 @@ public class RunVO implements Serializable {
      */
     private Integer loopCount;
     /**
+     * 本 run 生效的轮次上限（V88 起固化）；null 表示尚未记录，首次进入时解析并写入。
+     */
+    private Integer loopLimit;
+    /**
      * 失败原因（V87 起）。此前 run 失败不留任何原因，只能靠间接特征反推。
      */
     private String errorMessage;

@@ -166,6 +166,16 @@ copies from their origin skill. Replaces the old `SkillAutoUpdateSweeper`.
   （澄清现在也有这个洞，V82 一并修掉）。恢复时从 `currentRun.getLoopCount()` 起步；
   自增随循环顶部那次已有的 `updateRun` 一并落库，不额外增加写。
   `RunConverter` 是手写的，**加字段必须两边都改**，漏了不会报错、只会让护栏静默失效。
+- **轮次上限本身也必须固化（V88 `agent_run.loop_limit`），否则预算会中途缩水。** 只固化计数器
+  （`loop_count`）而不固化**分母**是不完整的：上限原本在每次进入循环时重新解析，而主 run 有
+  **5 个重入入口** —— 只有首次 `startRun` 在任务请求线程上（持有 `TaskLoopLimitHolder`，能拿到
+  `runner.task-max-loop-count`），`wait` 恢复 / 澄清恢复×2 / `WaitingRunReconciler` 抢救都在
+  **调度线程**上，会取不到 TASK 层而回落到更小的 `max-loop-count`（线上：任务本该 2000 轮，
+  一次挂起后就按 128 轮被 loop cap 打断）。故 `LoopLimitSource` 多了 `PINNED`，
+  `resolveMain` 把它排在最高优先级；`loop_limit` 与 `loop_count` 在**同一位置**落库，不额外增加写。
+  连带堵住「运行中改实例 `max_loop_count` / 改 `max-loop-count` 配置」造成的预算漂移。
+  **子 Agent 刻意不固化**：`SessionSubRunner` 是单次同步 for 循环、无挂起/恢复（每条出口恰好
+  `finishSubAgentRun` 一次），上限在一次调用内不会漂移 —— 加固化只会多出永远为 null 的参数与死字段。
 - **尾部预告块（loop 预算 + 终轮收口）必须每轮重建，不能原位替换。** 工具轮会往 messages 尾部
   追加 assistant(tool_calls)/tool/观察消息，预览若只做「原位替换」就会沉进历史中间 —— 既白烧
   context，又出现两份互相矛盾的「还剩几轮」。所以 `applyLoopBudget` 每轮先按
@@ -305,6 +315,21 @@ copies from their origin skill. Replaces the old `SkillAutoUpdateSweeper`.
 - **任务失败也必须让业务方看得见 run 产出。** `markTerminal` 只回 `{"error":...}` 会让业务方
   完全看不到模型干了什么；`TaskCallbackBody.remark` 此前线上 153 个任务全为空串。loop cap
   失败路径现用 `markTerminalWithRemark`（带 `replyJson(run)` + 原因文案）。
+
+## 任务超时：业务方指定值 + 服务端下限
+
+`effectiveTimeoutSeconds` 是**唯一 chokepoint**，同时决定任务存活闸门（`pollOnce`）与 MCP 凭证
+TTL（`submit` 签发 = 超时 + 15min），因此两者天然一致，不会出现「任务还在跑、凭证先过期」。
+
+口径是「业务方指定值与 `hri-ai.tasks.min-timeout-seconds` 取大者；未指定则回落 `max-poll-seconds`」。
+
+- **为什么需要下限**：线上 158 个任务里 **155 个由业务方显式传了 `taskTimeoutSeconds=3600`**，
+  且已固化进 `task_timeout_seconds` 列 —— **只改 `max-poll-seconds` 对它们完全无效**（只影响
+  3 个该列为 NULL 的任务）。下限是唯一能在不动业务方调用代码的前提下抬高实际超时的位置。
+- **实测耗时**（155 个任务）：均值 838s、最大 9818s(2h43m)，>2h 仅 2 个、>3h 为 0。取 3h(10800s)。
+- **下限默认 0 = 不设下限**，未配置该键的环境行为与改动前完全一致。
+- 代价要说清：业务方传 3600 却被实际执行 10800，**服务端单方面覆盖了调用方参数**。若后续
+  业务方主动改传更大值，两边自然对齐，下限退化为纯兜底。
 
 ## Conventions
 

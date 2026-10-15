@@ -69,9 +69,16 @@ class AgentTaskServiceImplTimeoutTest {
         field.setLong(service, value);
     }
 
+    private void setMinTimeoutSeconds(long value) throws Exception {
+        Field field = AgentTaskServiceImpl.class.getDeclaredField("minTimeoutSeconds");
+        field.setAccessible(true);
+        field.setLong(service, value);
+    }
+
     @Test
     void fallsBackToConfiguredDefaultWhenTaskHasNoTimeout() throws Exception {
         setDefaultMaxPollSeconds(3600L);
+        setMinTimeoutSeconds(0L);
 
         assertEquals(3600L, service.effectiveTimeoutSeconds(null));
     }
@@ -79,7 +86,48 @@ class AgentTaskServiceImplTimeoutTest {
     @Test
     void taskLevelTimeoutOverridesConfiguredDefault() throws Exception {
         setDefaultMaxPollSeconds(3600L);
+        setMinTimeoutSeconds(0L);
 
         assertEquals(120L, service.effectiveTimeoutSeconds(120));
+    }
+
+    // ---------- 超时下限（min-timeout-seconds） ----------
+
+    @Test
+    void businessValueBelowFloorIsRaisedToFloor() throws Exception {
+        // 线上 155/158 个任务由业务方显式传 3600，且已固化进 task_timeout_seconds 列。
+        // 改 max-poll-seconds 对它们无效，唯一能抬高实际超时的是这个下限。
+        setDefaultMaxPollSeconds(3600L);
+        setMinTimeoutSeconds(10800L);
+
+        assertEquals(10800L, service.effectiveTimeoutSeconds(3600));
+    }
+
+    @Test
+    void businessValueAboveFloorIsKept() throws Exception {
+        // 下限只兜底，不反过来压低业务方主动给的更大值
+        setDefaultMaxPollSeconds(3600L);
+        setMinTimeoutSeconds(10800L);
+
+        assertEquals(14400L, service.effectiveTimeoutSeconds(14400));
+    }
+
+    @Test
+    void nullTaskValueAlsoRespectsFloor() throws Exception {
+        // 下限高于默认值时，回落到默认值的任务同样要被抬起
+        setDefaultMaxPollSeconds(3600L);
+        setMinTimeoutSeconds(10800L);
+
+        assertEquals(10800L, service.effectiveTimeoutSeconds(null));
+    }
+
+    @Test
+    void floorOfZeroKeepsLegacyBehaviourExactly() throws Exception {
+        // 未配置该键的环境必须完全不变：业务方给多少就是多少
+        setDefaultMaxPollSeconds(3600L);
+        setMinTimeoutSeconds(0L);
+
+        assertEquals(120L, service.effectiveTimeoutSeconds(120));
+        assertEquals(3600L, service.effectiveTimeoutSeconds(null));
     }
 }

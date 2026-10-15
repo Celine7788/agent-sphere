@@ -25,6 +25,14 @@ public class AgentRun {
     /** 已消耗的 agent 循环轮次；跨挂起恢复递增，使 maxLoopCount 真正成为 per-run 预算。 */
     private Integer loopCount;
     /**
+     * 本 run 生效的轮次上限（V88 起固化）。
+     *
+     * <p>此前每次进入循环都重新解析上限，而 run 有 5 个重入入口、只有首次在任务请求线程上
+     * （持有 TaskLoopLimitHolder），其余入口在调度线程上会丢失 TASK 层而回落到较小值。
+     * 固化为 null 时才重新解析。
+     */
+    private Integer loopLimit;
+    /**
      * 失败原因（V87 起）。此前 run 挂了不留任何原因，事件里的 errorMessage 被丢弃、
      * 表上又没有对应列，导致「为什么失败」事后完全无法回答。
      */

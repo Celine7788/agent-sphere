@@ -111,6 +111,19 @@ public class AgentTaskServiceImpl implements AgentTaskService {
     @Value("${hri-ai.tasks.max-poll-seconds:3600}")
     private long defaultMaxPollSeconds;
 
+    /**
+     * 任务超时下限（秒）：业务方指定值低于此数时抬到下限。
+     *
+     * <p>为什么不能只调 max-poll-seconds：线上 158 个任务里 155 个由业务方<b>显式</b>传了
+     * taskTimeoutSeconds=3600，且已固化进 {@code task_timeout_seconds} 列 —— 改默认值只影响
+     * 3 个该列为 NULL 的任务。下限是唯一能在不动业务方调用代码的前提下抬高实际超时的位置。
+     *
+     * <p>实测耗时（155 个任务）：均值 838s、最大 9818s(2h43m)，&gt;2h 仅 2 个、&gt;3h 为 0。
+     * 取 3h 覆盖全部观测值。默认 0 表示「不设下限」，未配置该键的环境行为完全不变。
+     */
+    @Value("${hri-ai.tasks.min-timeout-seconds:0}")
+    private long minTimeoutSeconds;
+
     @Override
     public TaskVO submit(CreateTaskDTO dto, CallerAuth auth) {
         ResolvedIdentityVO identity = resolveIdentity(auth);
@@ -448,9 +461,21 @@ public class AgentTaskServiceImpl implements AgentTaskService {
         return updated > 0;
     }
 
-    /** 任务超时秒数：业务方指定则以其为准，否则回落到 AS 侧配置默认值（存量任务该列 NULL）。 */
+    /**
+     * 任务超时秒数：业务方指定值与配置下限取较大者；未指定时回落到配置默认值。
+     *
+     * <p>口径变更：此前是「业务方指定优先、无条件生效」。现多一条下限保护 ——
+     * 业务方普遍传 3600，但实测确有跑到 2h43m 的任务，按原口径会被判 "task poll timeout"
+     * 并丢弃已完成的结构化产出。
+     *
+     * <p><b>下游共用</b>：本方法同时决定任务存活闸门（{@code pollOnce}）与 MCP 凭证 TTL
+     * （{@code submit} 签发），两者天然一致，不会出现「任务还在跑、凭证先过期」。
+     */
     long effectiveTimeoutSeconds(Integer taskTimeoutSeconds) {
-        return taskTimeoutSeconds != null ? taskTimeoutSeconds : defaultMaxPollSeconds;
+        if (taskTimeoutSeconds == null) {
+            return Math.max(defaultMaxPollSeconds, minTimeoutSeconds);
+        }
+        return Math.max(taskTimeoutSeconds, minTimeoutSeconds);
     }
 
     /** 单任务一轮轮询：超时/run 终态/阶段推进。 */

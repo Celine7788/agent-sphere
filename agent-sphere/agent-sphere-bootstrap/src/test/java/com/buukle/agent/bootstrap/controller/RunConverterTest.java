@@ -87,4 +87,33 @@ class RunConverterTest {
         RunVO back = converter.toVO(do_);
         assertEquals("rate limited by upstream", back.getErrorMessage(), "DO → VO 必须带上失败原因");
     }
+
+    @Test
+    void loopLimit_roundTripsBothDirections() {
+        // loop_limit 是轮次预算的分母固化（V88）。漏掉一个方向不会报错，
+        // 只会让续跑时重新解析出更小的预算而中途缩水 —— 失败是静默的。
+        RunVO vo = new RunVO();
+        vo.setId(1L);
+        vo.setLoopCount(50);
+        vo.setLoopLimit(2000);
+
+        AgentRun do_ = converter.toDO(vo);
+        assertEquals(2000, do_.getLoopLimit(), "VO → DO 必须带上固化的轮次上限");
+
+        RunVO back = converter.toVO(do_);
+        assertEquals(2000, back.getLoopLimit(), "DO → VO 必须带上固化的轮次上限");
+        assertEquals(50, back.getLoopCount());
+    }
+
+    @Test
+    void loopLimit_nullStaysNullSoFirstEntryStillResolves() {
+        // 存量 run 的 loop_limit 为 NULL：必须原样透传，不能被默认值覆盖，
+        // 否则首次进入就没机会解析出正确的（可能更大的）预算。
+        RunVO vo = new RunVO();
+        vo.setId(1L);
+        vo.setLoopLimit(null);
+
+        assertNull(converter.toDO(vo).getLoopLimit());
+        assertNull(converter.toVO(converter.toDO(vo)).getLoopLimit());
+    }
 }

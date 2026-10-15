@@ -192,8 +192,13 @@ public class SessionRunner {
                 && topCtx.getAgentInstance().getMaxLoopCount() > 0
                 ? topCtx.getAgentInstance().getMaxLoopCount() : null;
 
+        // 上限固化（V88）：run 有多个重入入口（wait 恢复 / 澄清恢复 / 对账抢救），而 TaskLoopLimitHolder
+        // 只在任务请求线程上存在 —— 续跑时重新解析会让同一个 run 的预算中途缩水（2000 → 回落 128）。
+        // 已固化则直接沿用；null（首次进入 / 存量 run）才解析，随后与 loopCount 一并落库。
+        Integer pinnedLoopLimit = currentRun != null ? currentRun.getLoopLimit() : null;
         LoopLimitResolver.ResolvedLoopLimit loopLimit = LoopLimitResolver.resolveMain(
-                instanceLoopLimit, TaskLoopLimitHolder.get(), properties.getRunner().getMaxLoopCount());
+                pinnedLoopLimit, instanceLoopLimit, TaskLoopLimitHolder.get(),
+                properties.getRunner().getMaxLoopCount());
         int maxLoopCount = loopLimit.limit();
         LoopLimitSource loopSource = loopLimit.source();
         log.info("Run {} execution source={}, effective loop limit={}", currentRunId, loopSource, maxLoopCount);
@@ -223,6 +228,9 @@ public class SessionRunner {
             // 挂起 break 发生在自增之前，所以这里记的正是「本轮即将执行的序号」，
             // 恢复后从该值续跑不会重复或漏计。
             currentRun.setLoopCount(loopCount);
+            // 生效上限与 loopCount 同一位置落库（不额外增加写）：预算与计数器都是 per-run 的，
+            // 分母若不固化，续跑时会在调度线程上重新解析而缩水。
+            currentRun.setLoopLimit(maxLoopCount);
             runSpi.updateRun(currentRun);
 
             eventPublisher.publishEvent(new RuntimeEventVO(RunStatus.RUNNING,
